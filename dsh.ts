@@ -734,6 +734,9 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         recalledMemories,
         recalledTriples: recalled.triples,
         freshTurnCount,
+        // Tell the model the truth about its own history: with the takeover
+        // flags off nothing is archived, so the addition must not claim it is.
+        archivesHistory: contextCompactionEnabled || projectCompletedTurnTools,
         excludedSourceMessageIds: visibleMessageIds,
       });
       const text = [

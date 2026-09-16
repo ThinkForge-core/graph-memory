@@ -45,6 +45,29 @@ describe("buildSystemPromptAddition", () => {
     });
     expect(result).toBe(small);
   });
+
+  it("claims archiving only when the host really removes traces", () => {
+    const archiving = buildSystemPromptAddition({
+      hasMemory: true,
+      freshTurnCount: 5,
+      archivesHistory: true,
+    });
+    const visible = buildSystemPromptAddition({
+      hasMemory: true,
+      freshTurnCount: 5,
+      archivesHistory: false,
+    });
+    const unspecified = buildSystemPromptAddition({
+      hasMemory: true,
+      freshTurnCount: 5,
+    });
+
+    expect(archiving).toContain("intermediate reasoning and tool traces are archived");
+    expect(archiving).toContain("newest 5 completed question/final-answer pairs");
+    expect(visible).toContain("newest 5 completed question/final-answer pairs");
+    expect(visible).not.toContain("archived");
+    expect(unspecified).toBe(visible);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════
