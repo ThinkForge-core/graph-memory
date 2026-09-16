@@ -34,7 +34,14 @@
         # Graph Memory retains the newest completed user turns and replaces
         # the older model-surface prefix itself. This is model-free: no DSH
         # compaction/summarization request and no growing checkpoint.
-        contextCompactionEnabled: true
+        # Off by default: the archived prefix is never replayed to the model,
+        # so the takeover is refused unless recallEnabled and extractionEnabled
+        # are both on and can supply the replacement context.
+        contextCompactionEnabled: false
+        # Hide completed-turn tool/reasoning traces, keeping only the question
+        # and the final answer. Off by default for the same reason: the hidden
+        # trace survives only in the durable DSH log.
+        projectCompletedTurnTools: false
         freshTurnCount: 5
         # Secrets stay outside the bundle and repository. Set these variables
         # in the environment that starts DSH to enable semantic vector recall.

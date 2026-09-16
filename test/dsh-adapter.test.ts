@@ -122,8 +122,11 @@ describe("native DSH context takeover", () => {
     };
     apply(context, {
       dbPath: ":memory:",
-      extractionEnabled: false,
-      recallEnabled: false,
+      // Rolling compaction is opt-in and is refused unless the recall path can
+      // replace the archived prefix, so all three flags are required here.
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: true,
       freshTurnCount: 2,
     });
 
@@ -189,6 +192,92 @@ describe("native DSH context takeover", () => {
     await Promise.all(cleanups.map(cleanup => cleanup()));
   });
 
+  it("refuses surface compaction when the recall path cannot replace it", async () => {
+    const listeners = new Map<string, Array<(...args: any[]) => any>>();
+    const cleanups: Array<() => void | Promise<void>> = [];
+    const warnings: string[] = [];
+    const context: any = {
+      logger: {
+        info() {},
+        warn(message: unknown) { warnings.push(String(message)); },
+        error() {},
+      },
+      llm: { async *stream() {} },
+      tools: { register() { return () => {}; } },
+      credentials: { async resolve() { return undefined; } },
+      tokenMeter: { measure() { return { nodes: [] }; } },
+      on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+        const current = listeners.get(name) ?? [];
+        if (options?.prepend) current.unshift(listener);
+        else current.push(listener);
+        listeners.set(name, current);
+        return () => {};
+      },
+      effect(register: () => () => void | Promise<void>) {
+        cleanups.push(register());
+        return () => {};
+      },
+    };
+    apply(context, {
+      dbPath: ":memory:",
+      // Explicitly requested, but there is no recall and no extraction to put
+      // the archived prefix back, so the takeover must be refused.
+      extractionEnabled: false,
+      recallEnabled: false,
+      contextCompactionEnabled: true,
+      freshTurnCount: 2,
+    });
+
+    expect(warnings.some(message => message.includes("contextCompactionEnabled ignored"))).toBe(true);
+
+    const events: any[] = [];
+    const surface: number[] = [];
+    for (let turn = 1; turn <= 3; turn += 1) {
+      const userSeq = events.length;
+      events.push(user(userSeq));
+      surface.push(userSeq);
+      const assistantSeq = events.length;
+      events.push({ type: "assistant/message", seq: assistantSeq, data: {} });
+      surface.push(assistantSeq);
+    }
+    const agentListeners = new Map<string, Array<(...args: any[]) => any>>();
+    const session: any = {
+      id: "refusal-test",
+      events,
+      surface: { nodes: surface },
+      append(type: string, data: any, options?: any) {
+        const seq = events.length;
+        events.push({ type, seq, data, ...options });
+        return { seq };
+      },
+    };
+    const agent = {
+      id: "refusal-test",
+      session,
+      ctx: {
+        on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+          const current = agentListeners.get(name) ?? [];
+          if (options?.prepend) current.unshift(listener);
+          else current.push(listener);
+          agentListeners.set(name, current);
+          return () => {};
+        },
+      },
+    };
+    listeners.get("agent/created")![0]({ agent });
+    const next = async () => "continued";
+    const result = await agentListeners.get("agent/pre-step")![0]({
+      agent,
+      messages: [{ source: { kind: "user" } }],
+      signal: new AbortController().signal,
+    }, next);
+
+    expect(result).toBe("continued");
+    expect(events.some(event => event.type === "compaction/prune")).toBe(false);
+    expect(surface).toEqual([0, 1, 2, 3, 4, 5]);
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+  });
+
   it("keeps a 30-turn model surface bounded instead of growing linearly", async () => {
     const listeners = new Map<string, Array<(...args: any[]) => any>>();
     const cleanups: Array<() => void | Promise<void>> = [];
@@ -225,8 +314,11 @@ describe("native DSH context takeover", () => {
     };
     apply(context, {
       dbPath: ":memory:",
-      extractionEnabled: false,
-      recallEnabled: false,
+      // Same three flags as the takeover test above: the surface may only be
+      // rewritten while a recall path exists to replace what was archived.
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: true,
       freshTurnCount: 5,
     });
 

@@ -87,7 +87,7 @@ Confirm that `graph-memory/dsh` is active under **Settings → Plugins**. The de
 
 | Capability | Implementation |
 |---|---|
-| Context takeover | Configurable newest-N completed turns; one archive marker replaces the older model surface |
+| Context takeover | Opt-in (`contextCompactionEnabled`, off by default): with recall and extraction both on, the newest-N completed turns stay native and one archive marker replaces the older model surface. The takeover is refused when no recall path exists to replace what was archived |
 | Lightweight extraction | Only the user question and final answer; strict structured tool contract; no reasoning/tool transcript ingestion |
 | Query-first recall | Vector Top-K with FTS5 fallback; exact source Q/A travels with graph hits |
 | Durable memory | Local SQLite, stable provenance, cross-session and cross-project recall |

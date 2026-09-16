@@ -86,9 +86,18 @@ export interface Config {
   messageRetention?: MessageRetentionConfig;
   /** Keep this many newest real user turns as native question/final-answer endpoints on the DSH model surface. */
   freshTurnCount?: number;
-  /** Let Graph Memory replace older model-surface history without an LLM call. */
+  /**
+   * Let Graph Memory replace older model-surface history without an LLM call.
+   * Defaults to false. Ignored unless recallEnabled and extractionEnabled are
+   * both true: the archived prefix stays invisible to the model, and only the
+   * recall path can put anything back in its place.
+   */
   contextCompactionEnabled?: boolean;
-  /** Hide completed-turn tool traces while retaining the native question and final answer. */
+  /**
+   * Hide completed-turn tool traces while retaining the native question and
+   * final answer. Defaults to false: the hidden trace is never replayed to the
+   * model, it survives only in the durable DSH log.
+   */
   projectCompletedTurnTools?: boolean;
   /** Tools exposed to the assistant. Automatic recall never depends on a tool call. */
   assistantTools?: "search" | "all" | "none";
@@ -181,8 +190,11 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
     throw new TypeError(`[graph-memory] freshTurnCount must be a positive integer, received ${freshTurnCount}`);
   }
-  const contextCompactionEnabled = input.contextCompactionEnabled ?? true;
-  const projectCompletedTurnTools = input.projectCompletedTurnTools ?? true;
+  // Both surface rewrites default to OFF. They are lossless for the durable DSH
+  // log but not for the model, which only ever meets the archived prefix again
+  // through recall. Opt in explicitly once the recall path is known to work.
+  const contextCompactionRequested = input.contextCompactionEnabled ?? false;
+  const projectCompletedTurnTools = input.projectCompletedTurnTools ?? false;
   const assistantTools = input.assistantTools ?? "none";
   if (!["search", "all", "none"].includes(assistantTools)) {
     throw new TypeError(`[graph-memory] assistantTools must be search, all or none, received ${String(assistantTools)}`);
@@ -235,6 +247,23 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   };
   const extractionEnabled = input.extractionEnabled ?? true;
   const recallEnabled = input.recallEnabled ?? true;
+  // Fail-safe: replacing model-surface history is safe only when Graph Memory can
+  // put something back in its place. Without recall there is no replacement at
+  // all; without extraction the archived turns can never become recallable
+  // memories. Either way the model keeps answering as if the session had just
+  // started, so refuse the takeover instead of silently destroying the context.
+  const contextCompactionEnabled = contextCompactionRequested && recallEnabled && extractionEnabled;
+  if (contextCompactionRequested && !contextCompactionEnabled) {
+    const missing = [
+      recallEnabled ? null : "recallEnabled=false",
+      extractionEnabled ? null : "extractionEnabled=false",
+    ].filter((value): value is string => value !== null).join(", ");
+    ctx.logger.warn(
+      `[graph-memory] contextCompactionEnabled ignored (${missing}): archiving the model surface ` +
+      "without a working recall path would hide history with no replacement. " +
+      "Set recallEnabled and extractionEnabled to true to enable rolling compaction.",
+    );
+  }
   const db = openDb(config.dbPath);
   const recaller = new Recaller(db, config);
   const latestRoute = new Map<string, Route>();
