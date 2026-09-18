@@ -62,6 +62,13 @@ import {
   type MessageRetentionConfig,
   type MessageRetentionResult,
 } from "./src/store/retention.ts";
+import {
+  GRAPH_MEMORY_SETTINGS_NAMESPACE,
+  GRAPH_MEMORY_SETTINGS_SCHEMA,
+  graphMemorySettingsBase,
+  validateGraphMemorySettings,
+  type GraphMemorySettings,
+} from "./src/settings/schema.ts";
 
 export const name = "graph-memory-dsh";
 export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "sessions", "credentials", "tokenMeter"];
@@ -156,6 +163,63 @@ interface DshContext {
 
 const HOST = "dsh";
 const PLUGIN = "graph-memory";
+
+/** The slice of the DSH settings service this plugin uses. */
+interface SettingsScopeLike<T> {
+  get(): T;
+}
+
+/** Host settings provider, read through `ctx.get("settings")`. */
+interface SettingsProviderLike {
+  register<T>(
+    namespace: string,
+    schema: unknown,
+    options: { base?: unknown; applies?: "live" | "restart"; validate?: (value: T) => void },
+  ): SettingsScopeLike<T>;
+}
+
+/**
+ * Resolve the configuration the plugin should run with.
+ *
+ * The settings namespace layers schema defaults, the composition entry from
+ * `cordis.patch.yml`, and the user document the Settings card writes. Every
+ * field is consumed once while the plugin wires itself, so a stored change is
+ * picked up on the next `dsh web` start — the card says exactly that.
+ *
+ * Without a settings service (for example a host that does not compose it)
+ * the composition entry is authoritative, as it was before the namespace
+ * existed.
+ * @param ctx - the plugin context.
+ * @param input - the composition entry.
+ * @returns the effective configuration.
+ */
+function resolveSettings(ctx: DshContext, input: Config): Config {
+  const base = graphMemorySettingsBase(input);
+  const settings = ctx.get?.("settings") as SettingsProviderLike | undefined;
+  if (settings === undefined || typeof settings.register !== "function") {
+    // Optional: configuration validation must not depend on a fully
+    // materialized context, and both fields are absent in minimal harnesses.
+    ctx.logger?.warn?.("[graph-memory] settings service unavailable; using the composition configuration");
+    return base as Config;
+  }
+  try {
+    const scope = settings.register<GraphMemorySettings>(
+      GRAPH_MEMORY_SETTINGS_NAMESPACE,
+      GRAPH_MEMORY_SETTINGS_SCHEMA,
+      { base, applies: "restart", validate: validateGraphMemorySettings },
+    );
+    ctx.logger?.info?.(
+      `[graph-memory] settings namespace "${GRAPH_MEMORY_SETTINGS_NAMESPACE}" registered (applies on restart)`,
+    );
+    return scope.get() as Config;
+  } catch (error) {
+    ctx.logger?.warn?.(
+      `[graph-memory] settings registration failed, using the composition configuration: ${String(error)}`,
+    );
+    return base as Config;
+  }
+}
+
 function sessionKey(id: unknown): string {
   return `${HOST}:${String(id)}`;
 }
@@ -194,67 +258,70 @@ function stringOutput(title: string) {
 }
 
 export function apply(ctx: DshContext, input: Config = {}): void {
-  const freshTurnCount = input.freshTurnCount ?? 5;
+  // The composition entry is the base layer; the settings namespace, when the
+  // host composes one, supplies schema defaults and the user's overrides.
+  const effective: Config = resolveSettings(ctx, input);
+  const freshTurnCount = effective.freshTurnCount ?? 5;
   if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
     throw new TypeError(`[graph-memory] freshTurnCount must be a positive integer, received ${freshTurnCount}`);
   }
   // Both surface rewrites default to OFF. They are lossless for the durable DSH
   // log but not for the model, which only ever meets the archived prefix again
   // through recall. Opt in explicitly once the recall path is known to work.
-  const contextCompactionRequested = input.contextCompactionEnabled ?? false;
-  const projectCompletedTurnTools = input.projectCompletedTurnTools ?? false;
-  const assistantTools = input.assistantTools ?? "none";
+  const contextCompactionRequested = effective.contextCompactionEnabled ?? false;
+  const projectCompletedTurnTools = effective.projectCompletedTurnTools ?? false;
+  const assistantTools = effective.assistantTools ?? "none";
   if (!["search", "all", "none"].includes(assistantTools)) {
     throw new TypeError(`[graph-memory] assistantTools must be search, all or none, received ${String(assistantTools)}`);
   }
-  const recallMaxNodes = input.recallMaxNodes ?? DEFAULT_CONFIG.recallMaxNodes;
+  const recallMaxNodes = effective.recallMaxNodes ?? DEFAULT_CONFIG.recallMaxNodes;
   if (!Number.isInteger(recallMaxNodes) || recallMaxNodes < 1) {
     throw new TypeError(`[graph-memory] recallMaxNodes must be a positive integer, received ${recallMaxNodes}`);
   }
-  if (input.semanticScoreThreshold !== undefined && (
-    !Number.isFinite(input.semanticScoreThreshold)
-    || input.semanticScoreThreshold < -1
-    || input.semanticScoreThreshold > 1
+  if (effective.semanticScoreThreshold !== undefined && (
+    !Number.isFinite(effective.semanticScoreThreshold)
+    || effective.semanticScoreThreshold < -1
+    || effective.semanticScoreThreshold > 1
   )) {
     throw new TypeError(
-      `[graph-memory] semanticScoreThreshold must be between -1 and 1 when configured, received ${input.semanticScoreThreshold}`,
+      `[graph-memory] semanticScoreThreshold must be between -1 and 1 when configured, received ${effective.semanticScoreThreshold}`,
     );
   }
-  const maintenanceInterval = input.maintenanceInterval ?? DEFAULT_CONFIG.compactTurnCount;
+  const maintenanceInterval = effective.maintenanceInterval ?? DEFAULT_CONFIG.compactTurnCount;
   if (!Number.isInteger(maintenanceInterval) || maintenanceInterval < 1) {
     throw new TypeError(`[graph-memory] maintenanceInterval must be a positive integer, received ${maintenanceInterval}`);
   }
-  if (input.llmMaxTokens !== undefined && (!Number.isInteger(input.llmMaxTokens) || input.llmMaxTokens < 1)) {
-    throw new TypeError(`[graph-memory] llmMaxTokens must be a positive integer when explicitly configured, received ${String(input.llmMaxTokens)}`);
+  if (effective.llmMaxTokens !== undefined && (!Number.isInteger(effective.llmMaxTokens) || effective.llmMaxTokens < 1)) {
+    throw new TypeError(`[graph-memory] llmMaxTokens must be a positive integer when explicitly configured, received ${String(effective.llmMaxTokens)}`);
   }
-  if ((input.llmProvider === undefined) !== (input.llmModel === undefined)) {
+  if ((effective.llmProvider === undefined) !== (effective.llmModel === undefined)) {
     throw new TypeError("[graph-memory] llmProvider and llmModel must be configured together");
   }
-  const extractionReasoningEffort = input.llmReasoningEffort ?? "off";
+  const extractionReasoningEffort = effective.llmReasoningEffort ?? "off";
   if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(extractionReasoningEffort)) {
     throw new TypeError(`[graph-memory] unsupported llmReasoningEffort ${String(extractionReasoningEffort)}`);
   }
-  const messageRetention = normalizeMessageRetentionPolicy(input.messageRetention);
-  const credentialRef = input.embedding?.apiKeyEnv;
+  const messageRetention = normalizeMessageRetentionPolicy(effective.messageRetention);
+  const credentialRef = effective.embedding?.apiKeyEnv;
   if (credentialRef && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)) {
     throw new TypeError(`[graph-memory] embedding.apiKeyEnv must be a credential reference, received ${JSON.stringify(credentialRef)}`);
   }
-  const embedding = input.embedding ? {
-    ...input.embedding,
+  const embedding = effective.embedding ? {
+    ...effective.embedding,
     apiKeyResolver: credentialRef
       ? async () => (await ctx.credentials.resolve(credentialRef))?.value
       : undefined,
   } : undefined;
   const config: GmConfig = {
     ...DEFAULT_CONFIG,
-    dbPath: input.dbPath ?? "~/.dsh/graph-memory/graph-memory.db",
+    dbPath: effective.dbPath ?? "~/.dsh/graph-memory/graph-memory.db",
     compactTurnCount: maintenanceInterval,
     recallMaxNodes,
-    semanticScoreThreshold: input.semanticScoreThreshold ?? DEFAULT_CONFIG.semanticScoreThreshold,
+    semanticScoreThreshold: effective.semanticScoreThreshold ?? DEFAULT_CONFIG.semanticScoreThreshold,
     embedding,
   };
-  const extractionEnabled = input.extractionEnabled ?? true;
-  const recallEnabled = input.recallEnabled ?? true;
+  const extractionEnabled = effective.extractionEnabled ?? true;
+  const recallEnabled = effective.recallEnabled ?? true;
   // Fail-safe: replacing model-surface history is safe only when Graph Memory can
   // put something back in its place. Without recall there is no replacement at
   // all; without extraction the archived turns can never become recallable
@@ -278,7 +345,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   const extractChain = new Map<string, Promise<void>>();
   const turnCounts = new Map<string, number>();
   const embeddingConfigured = Boolean(
-    input.embedding?.apiKeyEnv || input.embedding?.baseURL || input.embedding?.baseUrl,
+    effective.embedding?.apiKeyEnv || effective.embedding?.baseURL || effective.embedding?.baseUrl,
   );
   let embeddingState: "fts-only" | "initializing" | "vector-ready" | "degraded" =
     embeddingConfigured ? "initializing" : "fts-only";
@@ -310,7 +377,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   const embeddingReady: Promise<void> = embeddingConfigured
     ? createEmbedFn(embedding).then(async (embed) => {
       if (embed && !closing) {
-        const fingerprint = [input.embedding?.baseURL ?? input.embedding?.baseUrl ?? "openai", input.embedding?.model ?? "default", input.embedding?.dimensions ?? "default"].join("|");
+        const fingerprint = [effective.embedding?.baseURL ?? effective.embedding?.baseUrl ?? "openai", effective.embedding?.model ?? "default", effective.embedding?.dimensions ?? "default"].join("|");
         recaller.setEmbedFn(embed, fingerprint);
         embeddingState = "vector-ready";
         for (const node of allActiveNodes(db)) {
@@ -329,8 +396,8 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     : Promise.resolve();
 
   async function complete(route: Route | undefined, system: string, user: string): Promise<string> {
-    const configured = input.llmProvider && input.llmModel
-      ? { provider: input.llmProvider, model: input.llmModel }
+    const configured = effective.llmProvider && effective.llmModel
+      ? { provider: effective.llmProvider, model: effective.llmModel }
       : undefined;
     // Extraction is an auxiliary workload, not a continuation of the Agent's
     // reasoning. An explicitly configured lightweight route must therefore
@@ -352,7 +419,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         reasoningEffort: extractionReasoningEffort,
         system: `${system}\n\nYou must call ${GRAPH_EXTRACTION_TOOL_NAME} exactly once. Do not emit a text response.`,
         tools: [GRAPH_EXTRACTION_TOOL],
-        ...(input.llmMaxTokens === undefined ? {} : { maxTokens: input.llmMaxTokens }),
+        ...(effective.llmMaxTokens === undefined ? {} : { maxTokens: effective.llmMaxTokens }),
         signal: controller.signal,
         messages: [{
           id: randomUUID(),
@@ -861,8 +928,8 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     execute: async () => {
       const stats = getStats(db);
       const vectors = getVectorStats(db);
-      const embeddingModel = embeddingConfigured && input.embedding?.model
-        ? ` (${input.embedding.model})`
+      const embeddingModel = embeddingConfigured && effective.embedding?.model
+        ? ` (${effective.embedding.model})`
         : "";
       const messageCount = Number((db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get() as any)?.count ?? 0);
       const turnVectorCount = Number((db.prepare("SELECT COUNT(*) AS count FROM gm_turn_vectors").get() as any)?.count ?? 0);
@@ -974,7 +1041,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       let scheduled = 0;
       for (const pendingSid of pending) {
         const rawId = pendingSid.startsWith(`${HOST}:`) ? pendingSid.slice(HOST.length + 1) : pendingSid;
-        if (input.llmProvider && input.llmModel || latestRoute.has(rawId)) {
+        if (effective.llmProvider && effective.llmModel || latestRoute.has(rawId)) {
           scheduleExtract(rawId);
           scheduled += 1;
         }
@@ -1001,7 +1068,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
 
   // With an explicit fallback route, recover durable pending work from prior
   // process exits even when those sessions are not reopened in the UI.
-  if (extractionEnabled && input.llmProvider && input.llmModel) {
+  if (extractionEnabled && effective.llmProvider && effective.llmModel) {
     for (const sid of getPendingSessionIds(db)) {
       scheduleExtract(sid.startsWith(`${HOST}:`) ? sid.slice(HOST.length + 1) : sid);
     }

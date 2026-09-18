@@ -31,6 +31,7 @@ for (const required of [
   "dist/index.js",
   "dist/dsh.js",
   "dist/src/store/sqlite.js",
+  "dist/src/settings/schema.js",
   "index.ts",
   "dsh.ts",
   "tsconfig.json",
