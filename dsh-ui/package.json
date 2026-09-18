@@ -1,0 +1,47 @@
+{
+  "name": "graph-memory-ui-dsh",
+  "version": "0.1.0-beta.3",
+  "description": "Graph Memory settings card for DeepSeek Harness Web",
+  "type": "module",
+  "scripts": {
+    "prepack": "node --check index.js && node --check client.js"
+  },
+  "engines": {
+    "node": ">=22.13.0",
+    "dsh": "^0.1.5-rc.2"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}
