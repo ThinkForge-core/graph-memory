@@ -65,8 +65,11 @@ export function apply(ctx, input = {}) {
     if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
         throw new TypeError(`[graph-memory] freshTurnCount must be a positive integer, received ${freshTurnCount}`);
     }
-    const contextCompactionEnabled = input.contextCompactionEnabled ?? true;
-    const projectCompletedTurnTools = input.projectCompletedTurnTools ?? true;
+    // Both surface rewrites default to OFF. They are lossless for the durable DSH
+    // log but not for the model, which only ever meets the archived prefix again
+    // through recall. Opt in explicitly once the recall path is known to work.
+    const contextCompactionRequested = input.contextCompactionEnabled ?? false;
+    const projectCompletedTurnTools = input.projectCompletedTurnTools ?? false;
     const assistantTools = input.assistantTools ?? "none";
     if (!["search", "all", "none"].includes(assistantTools)) {
         throw new TypeError(`[graph-memory] assistantTools must be search, all or none, received ${String(assistantTools)}`);
@@ -115,6 +118,21 @@ export function apply(ctx, input = {}) {
     };
     const extractionEnabled = input.extractionEnabled ?? true;
     const recallEnabled = input.recallEnabled ?? true;
+    // Fail-safe: replacing model-surface history is safe only when Graph Memory can
+    // put something back in its place. Without recall there is no replacement at
+    // all; without extraction the archived turns can never become recallable
+    // memories. Either way the model keeps answering as if the session had just
+    // started, so refuse the takeover instead of silently destroying the context.
+    const contextCompactionEnabled = contextCompactionRequested && recallEnabled && extractionEnabled;
+    if (contextCompactionRequested && !contextCompactionEnabled) {
+        const missing = [
+            recallEnabled ? null : "recallEnabled=false",
+            extractionEnabled ? null : "extractionEnabled=false",
+        ].filter((value) => value !== null).join(", ");
+        ctx.logger.warn(`[graph-memory] contextCompactionEnabled ignored (${missing}): archiving the model surface ` +
+            "without a working recall path would hide history with no replacement. " +
+            "Set recallEnabled and extractionEnabled to true to enable rolling compaction.");
+    }
     const db = openDb(config.dbPath);
     const recaller = new Recaller(db, config);
     const latestRoute = new Map();
@@ -547,6 +565,9 @@ export function apply(ctx, input = {}) {
                 recalledMemories,
                 recalledTriples: recalled.triples,
                 freshTurnCount,
+                // Tell the model the truth about its own history: with the takeover
+                // flags off nothing is archived, so the addition must not claim it is.
+                archivesHistory: contextCompactionEnabled || projectCompletedTurnTools,
                 excludedSourceMessageIds: visibleMessageIds,
             });
             const text = [
@@ -640,6 +661,21 @@ export function apply(ctx, input = {}) {
             return;
         ctx.tools.register(definition);
     }
+    // Automatic recall never depends on a tool call, so without this section the
+    // deliberate half of the plugin reaches the model only as schema
+    // descriptions scattered through the catalog. It renders only while the
+    // assistant tool surface is actually exposed, and stays to one sentence:
+    // this text is paid on every turn. Order 2950 places it in the tool-guidance
+    // band (after TOOL_REPORT, before the generated SDK).
+    if (assistantTools !== "none") {
+        ctx.systemPrompt?.section({
+            name: "graph-memory:tools",
+            order: 2950,
+            text: "Graph Memory keeps durable knowledge from earlier sessions: call gm_search when the task "
+                + "may have been solved before or the user refers to past work, and gm_record when this "
+                + "conversation produces a reusable solution, pitfall or workflow.",
+        });
+    }
     registerAssistantTool({
         name: "gm_status",
         description: "Check whether Graph Memory is active and which local store it uses.",
@@ -686,7 +722,7 @@ export function apply(ctx, input = {}) {
     });
     registerAssistantTool({
         name: "gm_record",
-        description: "Explicitly record reusable knowledge in Graph Memory.",
+        description: "Record reusable knowledge in Graph Memory: a solution, pitfall or workflow from this conversation that is worth reusing in a later session.",
         parameters: {
             type: "object",
             properties: {

@@ -299,6 +299,9 @@ const graphMemoryPlugin = {
                     recalledMemories: rec.turnMemories,
                     recalledTriples: rec.triples,
                     freshTurnCount: cfg.freshTurnCount,
+                    // OpenClaw really drops older/intermediate messages in
+                    // projectRecentTurns, so the archiving claim is accurate here.
+                    archivesHistory: true,
                 });
                 if (lastTurn.dropped > 0 || episodicXml) {
                     api.logger.info(`[graph-memory] assemble: retained ${lastTurn.messages.length} projected messages, ` +

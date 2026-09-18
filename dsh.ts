@@ -128,6 +128,14 @@ interface DshContext {
   tools: {
     register(definition: Record<string, unknown>): () => void;
   };
+  /**
+   * The harness prompt registry. Graph Memory contributes one short routing
+   * section here so gm_search/gm_record read as a capability rather than being
+   * met only as six one-line tool schemas.
+   */
+  systemPrompt?: {
+    section(entry: { name: string; order: number; text: string }): () => void;
+  };
   credentials: {
     resolve(ref: string): Promise<{ value: string; source: string } | undefined>;
   };
@@ -829,6 +837,22 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     ctx.tools.register(definition);
   }
 
+  // Automatic recall never depends on a tool call, so without this section the
+  // deliberate half of the plugin reaches the model only as schema
+  // descriptions scattered through the catalog. It renders only while the
+  // assistant tool surface is actually exposed, and stays to one sentence:
+  // this text is paid on every turn. Order 2950 places it in the tool-guidance
+  // band (after TOOL_REPORT, before the generated SDK).
+  if (assistantTools !== "none") {
+    ctx.systemPrompt?.section({
+      name: "graph-memory:tools",
+      order: 2950,
+      text: "Graph Memory keeps durable knowledge from earlier sessions: call gm_search when the task "
+        + "may have been solved before or the user refers to past work, and gm_record when this "
+        + "conversation produces a reusable solution, pitfall or workflow.",
+    });
+  }
+
   registerAssistantTool({
     name: "gm_status",
     description: "Check whether Graph Memory is active and which local store it uses.",
@@ -880,7 +904,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
 
   registerAssistantTool({
     name: "gm_record",
-    description: "Explicitly record reusable knowledge in Graph Memory.",
+    description: "Record reusable knowledge in Graph Memory: a solution, pitfall or workflow from this conversation that is worth reusing in a later session.",
     parameters: {
       type: "object",
       properties: {
