@@ -99,7 +99,9 @@ export function replaceDshArchivedPrefix(session, tokenMeter, range) {
     const replacement = session.append("user/message", {
         id: `graph-memory-archive:${String(session.id ?? "session")}:${range.start}-${range.end}`,
         role: "user",
-        source: { kind: "plugin", plugin: "graph-memory" },
+        // Session format v4 refuses the retired V3 wrapper `{kind: "plugin", plugin}`;
+        // the canonical producer-owned kind is `plugin:<name>`.
+        source: { kind: "plugin:graph-memory" },
         content: [{ type: "text", text: DSH_ARCHIVE_MARKER }],
     }, {
         // Match the current DSH Session surface-operation contract exactly.

@@ -186,7 +186,7 @@ describe("native DSH context takeover", () => {
     expect(events.at(-1)).toMatchObject({
       type: "user/message",
       surfaceOp: { op: "replace", startSeq: 0, endSeq: 1 },
-      data: { source: { kind: "plugin", plugin: "graph-memory" } },
+      data: { source: { kind: "plugin:graph-memory" } },
     });
     expect(surface).toEqual([events.length - 1, 2, 3, 4, 5]);
     await Promise.all(cleanups.map(cleanup => cleanup()));
@@ -518,7 +518,9 @@ describe("native DSH context takeover", () => {
 
     expect(decision.kind).toBe("enter");
     expect(decision.messages).toHaveLength(2);
-    expect(decision.messages[0].source).toMatchObject({ kind: "plugin", plugin: "graph-memory" });
+    expect(decision.messages[0].source).toMatchObject({ kind: "plugin:graph-memory" });
+    // Session format v4 refuses the retired wrapper at turn time.
+    expect(decision.messages[0].source).not.toHaveProperty("plugin");
     const recalled = decision.messages[0].content[0].text;
     expect(recalled).toContain("季度汇报 PPT 使用品牌模板");
     expect(recalled).toContain("主题色是深海蓝");

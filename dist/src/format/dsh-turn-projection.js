@@ -171,7 +171,9 @@ export function replaceDshCompletedTurnTrace(session, tokenMeter, range) {
     const replacement = session.append("user/message", {
         id: `graph-memory-turn-trace:${String(session.id ?? "session")}:${range.turn}`,
         role: "user",
-        source: { kind: "plugin", plugin: "graph-memory" },
+        // Session format v4 refuses the retired V3 wrapper `{kind: "plugin", plugin}`;
+        // the canonical producer-owned kind is `plugin:<name>`.
+        source: { kind: "plugin:graph-memory" },
         content: [{
                 type: "text",
                 text: `<graph-memory-trace turn="${range.turn}">Intermediate tool trace archived; the original question and final answer remain visible.</graph-memory-trace>`,

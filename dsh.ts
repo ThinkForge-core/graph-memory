@@ -163,6 +163,11 @@ interface DshContext {
 
 const HOST = "dsh";
 const PLUGIN = "graph-memory";
+// DSH session format v4 (core 0.1.7-rc.2) admits only producer-owned message
+// sources and refuses the retired V3 wrapper `{ kind: "plugin", plugin }` when a
+// message reaches the session log. The canonical v4 kind is exactly what the
+// v3-to-v4 converter writes for a plugin name: `plugin:<name>`.
+const PRODUCER_KIND = `plugin:${PLUGIN}`;
 
 /** The slice of the DSH settings service this plugin uses. */
 interface SettingsScopeLike<T> {
@@ -425,7 +430,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
           id: randomUUID(),
           role: "user",
           content: [{ type: "text", text: user }],
-          source: { kind: "plugin", plugin: PLUGIN },
+          source: { kind: PRODUCER_KIND },
         }],
       });
       for await (const chunk of chunks) {
@@ -782,13 +787,16 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         ? session.snapshotEvents()
         : session?.events;
       const visibleMessageIds = new Set(surfaceSeqs.map(seq => `${HOST}:${key}:${String(seq)}`));
-      const hasArchivedHistory = surfaceSeqs.some(seq => {
-        const event = immutableEvents?.[seq];
+      // Both shapes are recognised on purpose: v4 writes the producer-owned kind,
+      // while a legacy event object still in memory may carry the retired wrapper.
+      const isOwnArchivedMarker = (event: any) => {
+        const source = event?.data?.source;
         return event?.type === "user/message"
-          && event?.data?.source?.kind === "plugin"
-          && event?.data?.source?.plugin === PLUGIN
-          && event?.surfaceOp?.op === "replace";
-      });
+          && event?.surfaceOp?.op === "replace"
+          && (source?.kind === PRODUCER_KIND
+            || (source?.kind === "plugin" && source?.plugin === PLUGIN));
+      };
+      const hasArchivedHistory = surfaceSeqs.some(seq => isOwnArchivedMarker(immutableEvents?.[seq]));
       const recalledNodes = filterDshRecallNodes(
         recalled.nodes,
         getNodeSources(db, recalled.nodes.map(node => node.id)),
@@ -826,8 +834,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         id: randomUUID(),
         role: "user",
         source: {
-          kind: "plugin",
-          plugin: PLUGIN,
+          kind: PRODUCER_KIND,
           form: "snapshot",
           sections: [{ name: "graph-memory:recall", text }],
         },
