@@ -27,10 +27,15 @@ field to an advanced one is never hidden behind the advanced toggle.
 
 Editing a member applies the whole chain in **one atomic write** — the touched
 field plus every dependent value. The field the chain adjusted gets an
-`adjusted` badge, the chain segment that just pulled a value is lit in blue, and
-the reason ("8 recent turns → 3 memories per recall, so the total stays
-bounded") is stated once, in the caption under the row. The card never leaves a
-half-applied pair behind.
+`adjusted` badge and the reason ("8 recent turns → 3 memories per recall, so the
+total stays bounded") is stated once, in the caption under the row. The card
+never leaves a half-applied pair behind.
+
+**The paint of a segment states the link, it does not flash.** A live link is
+always drawn blue — that is what "Linked" in the caption means, whether or not
+anything has been adjusted yet — and the segment that just pulled a value is
+brighter and carries a glow. So a grey chain beside a "Linked" caption is not a
+state the card can be in: grey appears only while a link is broken.
 
 **A chain segment is also the switch that breaks the link.** Clicking one leaves
 the stored values exactly as they are and simply stops its rules from running:

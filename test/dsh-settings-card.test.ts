@@ -9,10 +9,20 @@ interface LinkOp {
   params?: Record<string, unknown>;
 }
 
+interface ChainVisual {
+  state: "active" | "linked" | "broken";
+  color: string;
+  opacity: number;
+  glow: boolean;
+  dashed: boolean;
+}
+
 interface ChainPolicy {
   BROKEN_CHAINS_KEY: string;
+  CHAIN_BLUE: string;
   CHAIN_GROUPS: string[][];
   chainKeyOf(index: number): string;
+  chainVisual(active: boolean, broken: boolean): ChainVisual;
   optimalRecallNodes(window: number): number;
   optimalValues(): Record<string, unknown>;
   linkedOps(
@@ -258,6 +268,45 @@ describe("settings card chain policy", () => {
       "extractionEnabled",
       "recallSessionHistory",
     ]);
+  });
+});
+
+describe("the painted state of a chain segment", () => {
+  const policy = loadChainPolicy();
+  const blue = policy.CHAIN_BLUE;
+
+  it("paints a live link blue even when nothing was just adjusted", () => {
+    const visual = policy.chainVisual(false, false);
+    expect(visual.state).toBe("linked");
+    expect(visual.color).toBe(blue);
+    expect(visual.dashed).toBe(false);
+    expect(visual.glow).toBe(false);
+  });
+
+  it("keeps the same blue but glows while the link just pulled a value", () => {
+    const visual = policy.chainVisual(true, false);
+    expect(visual.state).toBe("active");
+    expect(visual.color).toBe(blue);
+    expect(visual.glow).toBe(true);
+    expect(visual.opacity).toBeGreaterThan(policy.chainVisual(false, false).opacity);
+  });
+
+  it("drops the colour and dashes the segment once the link is broken", () => {
+    const visual = policy.chainVisual(true, true);
+    expect(visual.state).toBe("broken");
+    expect(visual.color).not.toBe(blue);
+    expect(visual.dashed).toBe(true);
+    expect(visual.glow).toBe(false);
+  });
+
+  it("never reports a live state for a broken link", () => {
+    for (const active of [false, true]) {
+      expect(policy.chainVisual(active, true).state).toBe("broken");
+    }
+  });
+
+  it("gives an unadjusted and a just-adjusted link the same hue, so the paint always means linked", () => {
+    expect(policy.chainVisual(true, false).color).toBe(policy.chainVisual(false, false).color);
   });
 });
 

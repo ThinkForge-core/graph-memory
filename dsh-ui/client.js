@@ -953,6 +953,29 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** The colour every live link is drawn in; the link's own state, not a flash. */
+    const CHAIN_BLUE = "rgb(70,150,220)";
+
+    /**
+     * How a chain is drawn. A live link is always blue — the colour states the
+     * link, it does not flash — and turns brighter with a glow for the moment it
+     * actually pulled a value into a neighbour. A broken link is dashed, dimmed
+     * and colourless. Pure, so the contract is testable without a browser.
+     */
+    function chainVisual(active, broken) {
+      if (broken === true) {
+        return { state: "broken", color: "currentColor", opacity: 0.6, glow: false, dashed: true };
+      }
+      const fired = active === true;
+      return {
+        state: fired ? "active" : "linked",
+        color: CHAIN_BLUE,
+        opacity: fired ? 1 : 0.72,
+        glow: fired,
+        dashed: false,
+      };
+    }
+
     /** The drawn segment between two linked settings; lit when it just pulled a value. */
     function chainSvg(width, color, opacity, dashed) {
       const count = Math.floor((width - 3) / 13);
@@ -974,24 +997,25 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** Standalone chain mark standing before a chain's caption. */
+    /** Standalone chain mark standing before a chain's caption; blue while linked. */
     function ChainMark(props) {
+      const visual = chainVisual(false, props.broken === true);
       return h(
         "span",
         { style: { display: "flex", alignItems: "center", flex: "0 0 auto" }, "aria-hidden": "true" },
-        chainSvg(30, "currentColor", 0.65, props.broken === true),
+        chainSvg(30, visual.color, visual.opacity, visual.dashed),
       );
     }
 
     /**
      * One drawn chain segment between two linked settings. It is the control
-     * that breaks and restores the link: lit in blue while it just pulled a
-     * value, dashed and dimmed once broken.
+     * that breaks and restores the link: blue while the link is live, brighter
+     * with a glow for the moment it pulled a value, dashed and dimmed once
+     * broken.
      */
     function ChainLink(props) {
-      const active = props.active === true;
       const broken = props.broken === true;
-      const color = active && !broken ? "rgb(70,150,220)" : "currentColor";
+      const visual = chainVisual(props.active === true, broken);
       const toggle = () => {
         if (typeof props.onToggle === "function") props.onToggle();
       };
@@ -1002,14 +1026,19 @@ window.__ModuleLoader__.load({
             {},
             styles.linkCell,
             broken ? styles.linkCellBroken : null,
-            { color, opacity: broken ? 0.6 : active ? 0.95 : 0.5, cursor: "pointer" },
+            {
+              color: visual.color,
+              opacity: visual.opacity,
+              cursor: "pointer",
+              filter: visual.glow ? "drop-shadow(0 0 4px rgba(70,150,220,0.8))" : undefined,
+            },
           ),
           title: props.t(broken ? "chainBrokenHint" : "chainClickHint"),
           role: "button",
           tabIndex: 0,
           "aria-pressed": broken,
           "aria-label": props.t(broken ? "chainBrokenHint" : "chainClickHint"),
-          "data-gm-link": broken ? "broken" : active ? "active" : "idle",
+          "data-gm-link": visual.state,
           onClick: toggle,
           onKeyDown: (event) => {
             if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
@@ -1018,7 +1047,7 @@ window.__ModuleLoader__.load({
             }
           },
         },
-        chainSvg(42, color, 1, broken),
+        chainSvg(42, visual.color, 1, visual.dashed),
       );
     }
 
@@ -1385,8 +1414,10 @@ window.__ModuleLoader__.load({
     // test/dsh-settings-card.test.ts. Not part of the plugin API.
     module.exports.__chainPolicy = {
       BROKEN_CHAINS_KEY,
+      CHAIN_BLUE,
       CHAIN_GROUPS,
       chainKeyOf,
+      chainVisual,
       optimalRecallNodes,
       optimalValues,
       linkedOps,
