@@ -32,6 +32,15 @@ the reason ("8 recent turns → 3 memories per recall, so the total stays
 bounded") is stated once, in the caption under the row. The card never leaves a
 half-applied pair behind.
 
+**A chain segment is also the switch that breaks the link.** Clicking one leaves
+the stored values exactly as they are and simply stops its rules from running:
+the segment turns dashed and grey, the caption says the settings now change on
+their own, and editing a member no longer touches the others. Clicking it again
+links them back. The state is per chain and lives in the browser
+(`localStorage`, key `graph-memory-ui:broken-chains`), not in the profile's
+settings document: breaking a link costs no restart, and a browser that refuses
+storage just starts with every chain linked.
+
 A box carries only what the drawing cannot say: the chain segments already show
 which fields are linked, so there is no per-field "linked" pill, and the Reset
 button — drawn only for a field overridden in the profile — is itself the
@@ -44,8 +53,7 @@ border.
 |---|---|---|
 | Allow history takeover | learning and recall on, and "restore this conversation's hidden history" on | hiding history is only safe while something can put it back — the path back is this session's own recall, not a per-turn re-read of other conversations |
 | Learning, recall or hidden-history restore off | takeover off | the Host refuses the takeover without a recall path that can return a hidden turn |
-| Recent turns kept (N) | max memories per recall | `clamp(round(20 / N), 1, 6)`: a wider window carries a smaller single injection, so the total stays bounded |
-| Memory from other conversations: every message | max memories per recall | only a per-message cross-session reach accumulates; a bounded reach caps the size instead of shrinking it |
+| Recent turns kept (N) | max memories per recall | `clamp(round(20 / N), 1, 6)`: a wider window carries a smaller single injection, so the total stays bounded. The window counts the snapshots that stay live, so the budget is the same for every cross-session reach |
 | Raw message retention ≠ `all` | dry run on | preview before the first real deletion |
 
 **Restore optimal settings** applies the validated combination in one write:

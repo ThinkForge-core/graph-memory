@@ -147,6 +147,10 @@ window.__ModuleLoader__.load({
       o_keep_recent: "recent — delete outside the window",
 
       chainHint: "Linked — change one and the others stay optimal.",
+      chainClickHint: "Click to break this link.",
+      chainBroken:
+        "Link broken — each setting changes on its own. Click the chain to link them again.",
+      chainBrokenHint: "Click to link these settings again.",
       autoTag: "adjusted",
       resetHint: "Overridden in your profile — click to return the default.",
       restoreOptimal: "Restore optimal settings",
@@ -158,8 +162,6 @@ window.__ModuleLoader__.load({
         "Without a working recall path the takeover is refused, so it is switched off.",
       chainReason_budget:
         "{window} recent turns → {nodes} memories per recall, so the total stays bounded.",
-      chainReason_firstTurn:
-        "Reading other conversations once never accumulates, so the size is capped rather than shrunk.",
       chainReason_dryRun:
         "Preview first: dry run stays on until you turn it off deliberately.",
     };
@@ -268,6 +270,9 @@ window.__ModuleLoader__.load({
       o_keep_recent: "recent —— 删除窗口之外的",
 
       chainHint: "联动 —— 修改一项，其余保持最优。",
+      chainClickHint: "点击断开此联动。",
+      chainBroken: "联动已断开 —— 各项设置各自变化。点击链条可重新联动。",
+      chainBrokenHint: "点击重新联动这些设置。",
       autoTag: "已自动调整",
       resetHint: "已在配置档案中覆盖 —— 点击恢复默认值。",
       restoreOptimal: "恢复最优设置",
@@ -277,7 +282,6 @@ window.__ModuleLoader__.load({
         "历史接管需要学习与召回开启，并且开启“恢复本对话被隐藏的历史”，否则被隐藏的部分无法再回来。",
       chainReason_noTakeover: "没有可用的召回路径时接管会被拒绝，因此已将其关闭。",
       chainReason_budget: "最近 {window} 轮 → 每次召回 {nodes} 条，以保证总量受限。",
-      chainReason_firstTurn: "其他对话只读取一次不会累积，因此只做上限约束，不缩小。",
       chainReason_dryRun: "先预演：在明确关闭之前保持仅预演。",
     };
 
@@ -486,7 +490,8 @@ window.__ModuleLoader__.load({
     // user actually touched, and its targets are written in the SAME atomic
     // mutation, so the card never shows a half-applied pair. RECALL_BUDGET and
     // the formula mirror the host's optimalRecallMaxNodes(): one policy, both
-    // halves.
+    // halves, and it holds for every cross-session reach — the window counts
+    // the live snapshots, however often a new one arrives.
 
     const RECALL_BUDGET = 20;
 
@@ -494,12 +499,6 @@ window.__ModuleLoader__.load({
       const value = Number(window);
       if (!Number.isFinite(value) || value < 1) return 6;
       return Math.min(6, Math.max(1, Math.round(RECALL_BUDGET / value)));
-    }
-
-    function capRecallNodes(value, max) {
-      const parsed = Number(value);
-      if (!Number.isFinite(parsed)) return max;
-      return Math.min(max, Math.max(1, Math.round(parsed)));
     }
 
     function setPath(root, path, value) {
@@ -514,8 +513,26 @@ window.__ModuleLoader__.load({
       return next;
     }
 
+    /**
+     * Chains drawn with a brace; order inside a group is the render order. The
+     * index doubles as a rule's `chain` id: breaking a chain in the card is
+     * exactly "stop running the rules that belong to it".
+     */
+    const CHAIN_GROUPS = [
+      ["contextCompactionEnabled", "recallEnabled", "extractionEnabled", "recallSessionHistory"],
+      ["freshTurnCount", "recallMaxNodes"],
+      ["messageRetention.keep", "messageRetention.dryRun"],
+    ];
+
+    /** The drawable, breakable id of a chain: its member keys in render order. */
+    function chainKeyOf(index) {
+      const members = CHAIN_GROUPS[index];
+      return members === undefined ? "" : members.join("+");
+    }
+
     const LINKS = [
       {
+        chain: 0,
         // Hiding history is only safe when something can put it back. The path
         // back is this conversation's own recall — NOT a per-turn re-read of
         // unrelated conversations, which the reach setting above governs.
@@ -536,6 +553,7 @@ window.__ModuleLoader__.load({
         },
       },
       {
+        chain: 0,
         // The host refuses the takeover without a recall path; say so here too.
         from: ["recallEnabled", "extractionEnabled", "recallSessionHistory"],
         apply(values) {
@@ -547,16 +565,13 @@ window.__ModuleLoader__.load({
         },
       },
       {
-        // Window up, single injection down: the total stays bounded. Only a
-        // per-message cross-session reach accumulates per turn, so the budget
-        // formula applies there; the other reaches cap the size instead.
-        from: ["freshTurnCount", "recallCrossSession"],
+        chain: 1,
+        // Window up, single injection down: the total stays bounded. The
+        // window counts the snapshots that stay live, not how often a new one
+        // arrives, so the budget is the same for a per-message and a
+        // once-per-session cross-session reach.
+        from: ["freshTurnCount"],
         apply(values) {
-          if (values.recallCrossSession !== "every-turn") {
-            const capped = capRecallNodes(values.recallMaxNodes, 6);
-            if (values.recallMaxNodes === capped) return [];
-            return [{ path: ["recallMaxNodes"], value: capped, reason: "chainReason_firstTurn" }];
-          }
           const next = optimalRecallNodes(values.freshTurnCount);
           if (values.recallMaxNodes === next) return [];
           return [{
@@ -568,6 +583,7 @@ window.__ModuleLoader__.load({
         },
       },
       {
+        chain: 2,
         from: ["messageRetention.keep"],
         apply(values) {
           const keep = readPath(values, ["messageRetention", "keep"]);
@@ -576,13 +592,6 @@ window.__ModuleLoader__.load({
           return [{ path: ["messageRetention", "dryRun"], value: true, reason: "chainReason_dryRun" }];
         },
       },
-    ];
-
-    /** Chains drawn with a brace; order inside a group is the render order. */
-    const CHAIN_GROUPS = [
-      ["contextCompactionEnabled", "recallEnabled", "extractionEnabled", "recallSessionHistory"],
-      ["freshTurnCount", "recallMaxNodes"],
-      ["messageRetention.keep", "messageRetention.dryRun"],
     ];
 
     /** Field lookup by path key, used to place a chain row in a group. */
@@ -612,12 +621,15 @@ window.__ModuleLoader__.load({
     /**
      * Resolve the chain reachable from `changedKey`, applying each rule to a
      * working copy so later rules see earlier results. Bounded so a future rule
-     * cycle cannot loop the card.
+     * cycle cannot loop the card. A chain the user broke (`brokenChains`, a set
+     * of {@link chainKeyOf} ids) contributes no rules at all, so its members
+     * change one at a time, exactly as the card draws it.
      */
-    function linkedOps(values, changedKey, skipKeys) {
+    function linkedOps(values, changedKey, skipKeys, brokenChains) {
       let working = values;
       const emitted = [];
       const seen = new Set(skipKeys);
+      const broken = new Set(brokenChains === undefined ? [] : brokenChains);
       let queue = [changedKey];
       let guard = 0;
       while (queue.length && guard < 8) {
@@ -626,6 +638,7 @@ window.__ModuleLoader__.load({
         for (const key of queue) {
           for (const rule of LINKS) {
             if (!rule.from.includes(key)) continue;
+            if (broken.has(chainKeyOf(rule.chain))) continue;
             for (const op of rule.apply(working)) {
               const target = pathKey(op.path);
               if (seen.has(target)) continue;
@@ -821,7 +834,17 @@ window.__ModuleLoader__.load({
         minWidth: "32px",
         padding: "0 2px",
       },
+      // A broken segment is a control, not decoration: it reads as a button and
+      // keeps the click target big enough for a chain cell that is only 32px
+      // wide.
+      linkCellBroken: {
+        background: "rgba(127,127,127,0.12)",
+        borderRadius: "6px",
+        outline: "1px dashed rgba(127,127,127,0.5)",
+        outlineOffset: "1px",
+      },
       chainNote: { fontSize: "11px", opacity: 0.6, lineHeight: 1.4 },
+      chainNoteBroken: { fontSize: "11px", color: "rgb(214,158,46)", opacity: 0.9, lineHeight: 1.4 },
       autoTag: {
         fontSize: "10.5px",
         textTransform: "uppercase",
@@ -931,7 +954,7 @@ window.__ModuleLoader__.load({
     }
 
     /** The drawn segment between two linked settings; lit when it just pulled a value. */
-    function chainSvg(width, color, opacity) {
+    function chainSvg(width, color, opacity, dashed) {
       const count = Math.floor((width - 3) / 13);
       return h(
         "svg",
@@ -946,6 +969,7 @@ window.__ModuleLoader__.load({
           fill: "none",
           stroke: color,
           strokeWidth: 1.2,
+          strokeDasharray: dashed === true ? "2.4 2" : undefined,
         })),
       );
     }
@@ -955,23 +979,79 @@ window.__ModuleLoader__.load({
       return h(
         "span",
         { style: { display: "flex", alignItems: "center", flex: "0 0 auto" }, "aria-hidden": "true" },
-        chainSvg(30, "currentColor", 0.65),
+        chainSvg(30, "currentColor", 0.65, props.broken === true),
       );
     }
 
-    /** One drawn chain segment between two linked settings; lit when it just pulled a value. */
+    /**
+     * One drawn chain segment between two linked settings. It is the control
+     * that breaks and restores the link: lit in blue while it just pulled a
+     * value, dashed and dimmed once broken.
+     */
     function ChainLink(props) {
       const active = props.active === true;
-      const color = active ? "rgb(70,150,220)" : "currentColor";
+      const broken = props.broken === true;
+      const color = active && !broken ? "rgb(70,150,220)" : "currentColor";
+      const toggle = () => {
+        if (typeof props.onToggle === "function") props.onToggle();
+      };
       return h(
         "div",
         {
-          style: Object.assign({}, styles.linkCell, { color, opacity: active ? 0.95 : 0.5 }),
-          title: props.t("chainHint"),
-          "data-gm-link": active ? "active" : "idle",
+          style: Object.assign(
+            {},
+            styles.linkCell,
+            broken ? styles.linkCellBroken : null,
+            { color, opacity: broken ? 0.6 : active ? 0.95 : 0.5, cursor: "pointer" },
+          ),
+          title: props.t(broken ? "chainBrokenHint" : "chainClickHint"),
+          role: "button",
+          tabIndex: 0,
+          "aria-pressed": broken,
+          "aria-label": props.t(broken ? "chainBrokenHint" : "chainClickHint"),
+          "data-gm-link": broken ? "broken" : active ? "active" : "idle",
+          onClick: toggle,
+          onKeyDown: (event) => {
+            if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+              event.preventDefault();
+              toggle();
+            }
+          },
         },
-        chainSvg(42, color, 1),
+        chainSvg(42, color, 1, broken),
       );
+    }
+
+    /**
+     * Chains the user broke by clicking. This is a property of the card, not of
+     * the plugin: it lives in the browser, so breaking a link costs no restart
+     * and never writes to the profile's settings document. A browser without
+     * storage (or one that refuses it, as private mode does) simply starts with
+     * every chain linked.
+     */
+    const BROKEN_CHAINS_KEY = "graph-memory-ui:broken-chains";
+
+    function readBrokenChains() {
+      try {
+        if (typeof localStorage === "undefined") return new Set();
+        const raw = localStorage.getItem(BROKEN_CHAINS_KEY);
+        if (raw === null) return new Set();
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed)
+          ? new Set(parsed.filter((key) => typeof key === "string"))
+          : new Set();
+      } catch (_error) {
+        return new Set();
+      }
+    }
+
+    function writeBrokenChains(broken) {
+      try {
+        if (typeof localStorage === "undefined") return;
+        localStorage.setItem(BROKEN_CHAINS_KEY, JSON.stringify(Array.from(broken)));
+      } catch (_error) {
+        // Remembering the break is a convenience; the in-memory state still holds.
+      }
     }
 
     /** The Graph Memory settings card: one-liner for the card list, form for its page. */
@@ -985,6 +1065,39 @@ window.__ModuleLoader__.load({
       const [advanced, setAdvanced] = React.useState(false);
       // Fields the chain just changed, keyed by path → the reason to show.
       const [adjustments, setAdjustments] = React.useState({});
+      // Chains the user broke by clicking a segment; their rules never run.
+      const [brokenChains, setBrokenChains] = React.useState(readBrokenChains);
+
+      // A derived number cannot stay stale. The window/budget chain is pure
+      // arithmetic, so the card recomputes the budget once, when it opens: a
+      // profile written before the formula covered every cross-session reach
+      // (12 turns beside 4 memories) would otherwise still show the very pair
+      // the chain exists to prevent, until the next edit. Boolean chains are
+      // deliberately NOT reconciled on open — those are preferences, and
+      // flipping a feature switch from a page load would be a surprise. Break
+      // the chain and this stops too; the click is the escape hatch.
+      const reconciledOnce = React.useRef(false);
+      React.useEffect(() => {
+        if (reconciledOnce.current) return;
+        // The Plugins list draws the one-liner through this same component:
+        // never write settings while someone is only looking at the list.
+        if (props.view === "summary") return;
+        if (snapshot.status !== "ready" || !isPlainObject(snapshot.value)) return;
+        if (snapshot.writable === false) return;
+        if (readPath(snapshot.value, ["freshTurnCount"]) === undefined) return;
+        reconciledOnce.current = true;
+        const ops = linkedOps(snapshot.value, "freshTurnCount", ["freshTurnCount"], brokenChains);
+        if (ops.length === 0) return;
+        const nextAdjustments = {};
+        for (const op of ops) {
+          nextAdjustments[pathKey(op.path)] = { reason: op.reason, params: op.params };
+        }
+        setAdjustments(nextAdjustments);
+        Promise.resolve(scope.mutate(ops.map((op) => ({ op: "set", path: op.path, value: op.value })))).then(
+          () => { setSaved(true); },
+          (reason) => { setError(reason && reason.message ? reason.message : String(reason)); },
+        );
+      }, [snapshot, brokenChains, scope, props.view]);
 
       // The Plugins page draws the card's title, icon, and crumb itself and
       // asks the entry for the one-liner beside the title, then for the body.
@@ -1030,7 +1143,7 @@ window.__ModuleLoader__.load({
         const staged = payload === undefined
           ? (isPlainObject(value) ? value : {})
           : setPath(isPlainObject(value) ? value : {}, path, payload);
-        const linked = payload === undefined ? [] : linkedOps(staged, changedKey, [changedKey]);
+        const linked = payload === undefined ? [] : linkedOps(staged, changedKey, [changedKey], brokenChains);
         const ops = [];
         ops.push(payload === undefined ? { op: "unset", path } : { op: "set", path, value: payload });
         for (const op of linked) ops.push({ op: "set", path: op.path, value: op.value });
@@ -1064,6 +1177,23 @@ window.__ModuleLoader__.load({
           () => { setSaved(true); },
           (reason) => { setError(reason && reason.message ? reason.message : String(reason)); },
         );
+      }
+
+      /**
+       * Break or restore one chain. The stored values are left exactly as they
+       * are — the break only stops the rules from running, so nothing jumps
+       * under the cursor. Breaking also drops the "adjusted" badges of the
+       * members: they described an automatic pull that no longer happens.
+       */
+      function toggleChain(key) {
+        const next = new Set(brokenChains);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        writeBrokenChains(next);
+        setBrokenChains(next);
+        const nextAdjustments = Object.assign({}, adjustments);
+        for (const member of key.split("+")) delete nextAdjustments[member];
+        setAdjustments(nextAdjustments);
       }
 
       /** Put the whole validated combination back in one write. */
@@ -1126,7 +1256,7 @@ window.__ModuleLoader__.load({
             continue;
           }
           for (const member of chain) consumed.add(member);
-          items.push({ kind: "chain", key: `chain:${chain.join("+")}`, members: chain });
+          items.push({ kind: "chain", key: `chain:${chain.join("+")}`, chainKey: chain.join("+"), members: chain });
         }
         if (items.length === 0) continue;
 
@@ -1141,30 +1271,46 @@ window.__ModuleLoader__.load({
           const members = item.members
             .map((key) => FIELD_BY_PATH.get(key))
             .filter((field) => field !== undefined);
-          const notes = members
-            .map((field) => adjustments[pathKey(field.path)])
-            .filter((adjustment) => adjustment !== undefined)
-            .map((adjustment) => t(adjustment.reason, adjustment.params || {}));
+          const broken = brokenChains.has(item.chainKey);
+          const notes = broken
+            ? []
+            : members
+              .map((field) => adjustments[pathKey(field.path)])
+              .filter((adjustment) => adjustment !== undefined)
+              .map((adjustment) => t(adjustment.reason, adjustment.params || {}));
           const parts = [];
           members.forEach((field, index) => {
             if (index > 0) {
-              const lit = [members[index - 1], field]
+              const lit = !broken && [members[index - 1], field]
                 .some((entry) => adjustments[pathKey(entry.path)] !== undefined);
-              parts.push(h(ChainLink, { key: `link:${index}`, active: lit, t }));
+              parts.push(h(ChainLink, {
+                key: `link:${index}`,
+                active: lit,
+                broken,
+                onToggle: () => { toggleChain(item.chainKey); },
+                t,
+              }));
             }
             parts.push(renderField(field, "chain"));
           });
+          const caption = broken
+            ? { style: styles.chainNoteBroken, text: t("chainBroken") }
+            : notes.length > 0
+              ? { style: styles.autoNote, text: notes.join(" ") }
+              : { style: styles.chainNote, text: t("chainHint") };
           rows.push(h(
             "div",
-            { key: item.key, style: styles.chainBlock },
+            {
+              key: item.key,
+              style: styles.chainBlock,
+              "data-gm-chain-state": broken ? "broken" : "linked",
+            },
             h("div", { style: styles.row }, parts),
             h(
               "div",
               { style: styles.chainNoteRow, "data-gm-chain-note": item.key },
-              h(ChainMark, {}),
-              h("span", { style: notes.length > 0 ? styles.autoNote : styles.chainNote }, notes.length > 0
-                ? notes.join(" ")
-                : t("chainHint")),
+              h(ChainMark, { broken }),
+              h("span", { style: caption.style }, caption.text),
             ),
           ));
         }
@@ -1238,10 +1384,14 @@ window.__ModuleLoader__.load({
     // Internal test seam: the linkage policy is exercised headlessly by
     // test/dsh-settings-card.test.ts. Not part of the plugin API.
     module.exports.__chainPolicy = {
+      BROKEN_CHAINS_KEY,
       CHAIN_GROUPS,
+      chainKeyOf,
       optimalRecallNodes,
       optimalValues,
       linkedOps,
+      readBrokenChains,
+      writeBrokenChains,
     };
     return module.exports;
   },

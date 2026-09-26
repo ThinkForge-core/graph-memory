@@ -10,18 +10,34 @@ interface LinkOp {
 }
 
 interface ChainPolicy {
+  BROKEN_CHAINS_KEY: string;
   CHAIN_GROUPS: string[][];
+  chainKeyOf(index: number): string;
   optimalRecallNodes(window: number): number;
   optimalValues(): Record<string, unknown>;
-  linkedOps(values: Record<string, unknown>, changedKey: string, skip: string[]): LinkOp[];
+  linkedOps(
+    values: Record<string, unknown>,
+    changedKey: string,
+    skip: string[],
+    brokenChains?: string[],
+  ): LinkOp[];
+  readBrokenChains(): Set<string>;
+  writeBrokenChains(broken: Set<string>): void;
 }
 
 /** Load the browser half the way the module loader does, without a browser. */
-function loadChainPolicy(): ChainPolicy {
+function loadChainPolicy(storage?: Record<string, string>): ChainPolicy {
   let loaded: { id: string; factory: (require: (id: string) => unknown) => any } | undefined;
-  runInNewContext(readFileSync(new URL("../dsh-ui/client.js", import.meta.url), "utf8"), {
+  const sandbox: Record<string, unknown> = {
     window: { __ModuleLoader__: { load: (entry: any) => { loaded = entry; } } },
-  });
+  };
+  if (storage !== undefined) {
+    sandbox.localStorage = {
+      getItem: (key: string) => (key in storage ? storage[key] : null),
+      setItem: (key: string, value: string) => { storage[key] = value; },
+    };
+  }
+  runInNewContext(readFileSync(new URL("../dsh-ui/client.js", import.meta.url), "utf8"), sandbox);
   expect(loaded?.id).toBe("graph-memory-ui-dsh");
   const react = {
     createElement: (...args: unknown[]) => ({ args }),
@@ -136,7 +152,7 @@ describe("settings card chain policy", () => {
     ]);
   });
 
-  it("a wider window tightens the per-recall size under a per-message reach", () => {
+  it("a wider window tightens the per-recall size", () => {
     const ops = policy.linkedOps(
       { freshTurnCount: 8, recallCrossSession: "every-turn", recallMaxNodes: 6 },
       "freshTurnCount",
@@ -150,13 +166,68 @@ describe("settings card chain policy", () => {
     }]);
   });
 
-  it("a bounded reach caps the size instead of shrinking it", () => {
-    const ops = policy.linkedOps(
-      { recallCrossSession: "first-turn", recallMaxNodes: 9, freshTurnCount: 5 },
-      "recallCrossSession",
-      ["recallCrossSession"],
+  it("applies the same budget under every cross-session reach", () => {
+    // The window counts the snapshots that stay live, not how often a new one
+    // arrives: a bounded reach shrinks the injection exactly like a per-message
+    // one, because the total is bounded in both cases.
+    const forReach = (reach: string) => policy.linkedOps(
+      { freshTurnCount: 12, recallCrossSession: reach, recallMaxNodes: 4 },
+      "freshTurnCount",
+      ["freshTurnCount"],
     );
-    expect(ops).toEqual([{ path: ["recallMaxNodes"], value: 6, reason: "chainReason_firstTurn" }]);
+    const expected = [{
+      path: ["recallMaxNodes"],
+      value: 2,
+      reason: "chainReason_budget",
+      params: { window: 12, nodes: 2 },
+    }];
+    expect(forReach("first-turn")).toEqual(expected);
+    expect(forReach("every-turn")).toEqual(expected);
+  });
+
+  it("runs no rule of a chain the user broke", () => {
+    const key = policy.chainKeyOf(1);
+    expect(key).toBe("freshTurnCount+recallMaxNodes");
+    expect(policy.linkedOps(
+      { freshTurnCount: 12, recallCrossSession: "first-turn", recallMaxNodes: 4 },
+      "freshTurnCount",
+      ["freshTurnCount"],
+      [key],
+    )).toEqual([]);
+    // A break is per chain: the other chains keep working.
+    expect(policy.linkedOps(
+      { messageRetention: { keep: "recent", dryRun: false } },
+      "messageRetention.keep",
+      ["messageRetention.keep"],
+      [key],
+    )).toEqual([
+      { path: ["messageRetention", "dryRun"], value: true, reason: "chainReason_dryRun" },
+    ]);
+  });
+
+  it("a broken takeover chain stops forcing the recall path on", () => {
+    const key = policy.chainKeyOf(0);
+    expect(policy.linkedOps(
+      {
+        contextCompactionEnabled: true,
+        extractionEnabled: false,
+        recallEnabled: false,
+        recallSessionHistory: false,
+      },
+      "contextCompactionEnabled",
+      ["contextCompactionEnabled"],
+      [key],
+    )).toEqual([]);
+  });
+
+  it("every drawn chain has a breakable id", () => {
+    expect(policy.CHAIN_GROUPS.map((_members, index) => policy.chainKeyOf(index)))
+      .toEqual([
+        "contextCompactionEnabled+recallEnabled+extractionEnabled+recallSessionHistory",
+        "freshTurnCount+recallMaxNodes",
+        "messageRetention.keep+messageRetention.dryRun",
+      ]);
+    expect(policy.chainKeyOf(99)).toBe("");
   });
 
   it("enabling retention pruning turns the dry run on first", () => {
@@ -187,5 +258,28 @@ describe("settings card chain policy", () => {
       "extractionEnabled",
       "recallSessionHistory",
     ]);
+  });
+});
+
+describe("broken chains in the browser", () => {
+  it("remembers a break across a reload", () => {
+    const store: Record<string, string> = {};
+    const first = loadChainPolicy(store);
+    first.writeBrokenChains(new Set(["freshTurnCount+recallMaxNodes"]));
+    expect(store[first.BROKEN_CHAINS_KEY]).toBe('["freshTurnCount+recallMaxNodes"]');
+    expect(Array.from(loadChainPolicy(store).readBrokenChains()))
+      .toEqual(["freshTurnCount+recallMaxNodes"]);
+  });
+
+  it("starts with every chain linked when the browser has no storage", () => {
+    expect(Array.from(loadChainPolicy().readBrokenChains())).toEqual([]);
+  });
+
+  it("ignores a corrupted entry instead of failing the card", () => {
+    const key = loadChainPolicy().BROKEN_CHAINS_KEY;
+    expect(Array.from(loadChainPolicy({ [key]: "not json" }).readBrokenChains())).toEqual([]);
+    expect(Array.from(loadChainPolicy({ [key]: '{"a":1}' }).readBrokenChains())).toEqual([]);
+    expect(Array.from(loadChainPolicy({ [key]: '["ok", 7, null]' }).readBrokenChains()))
+      .toEqual(["ok"]);
   });
 });

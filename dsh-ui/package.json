@@ -1,6 +1,6 @@
 {
   "name": "graph-memory-ui-dsh",
-  "version": "0.1.0-beta.10",
+  "version": "0.1.0-beta.11",
   "description": "Graph Memory settings card for DeepSeek Harness Web",
   "type": "module",
   "scripts": {
