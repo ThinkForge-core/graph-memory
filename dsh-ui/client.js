@@ -2,11 +2,14 @@
  * Browser half of Graph Memory — the plugin's settings card.
  *
  * Hand-written factory-form module (the same shape `graph-memory-pro-dsh`
- * uses): no bundler, no JSX, no build step. The card registers into
- * `settings.plugin.item` under the `graph-memory` settings namespace, which is
- * the key the configurable-plugins tab dispatches on, and declares that
- * namespace on the locale service so the framework hands it a `t` seat and
- * re-renders on a language switch.
+ * uses): no bundler, no JSX, no build step. The card is the configuration of
+ * the `graph-memory` bundle: it registers into the Plugins page's
+ * `plugins.bundle.config` keyed by that package name, and the page renders it
+ * on the bundle's own page — the one a click on the bundle's card in the
+ * Installed list opens. Gating on the Host serving the `graph-memory` settings
+ * namespace keeps an unserved entry from showing an empty section. It declares
+ * the same namespace on the locale service so the framework hands it a `t`
+ * seat and re-renders on a language switch.
  *
  * The `__ModuleLoader__` id is this package's own name: the client module
  * system requires each bundle to register the package whose Loader row owns
@@ -14,10 +17,11 @@
  * factory.
  *
  * Every field is read once when the Host plugin starts, so the card tells the
- * user that changes apply on the next `dsh web` start; the Host namespace
- * declares `applies: "restart"`.
+ * user that changes apply on the next `dsh web` start. The Host schema marks
+ * these fields volatile, so a write updates the stored value without
+ * remounting the plugin; nothing reads the new value before that restart.
  *
- * The card reads and writes through `ctx.settingsScope`, which owns revision
+ * The card reads and writes through `ctx.configForms`, which owns revision
  * fencing, per-field overrides, and recovery — this module only renders.
  */
 window.__ModuleLoader__.load({
@@ -32,6 +36,7 @@ window.__ModuleLoader__.load({
     // ── dictionaries ────────────────────────────────────────────────────────
 
     const en = {
+      title: "Graph Memory",
       description:
         "What the memory layer learns, recalls, and keeps. Values live in the profile's settings document; cordis.patch.yml stays the base layer.",
       subtitle: "Learning, recall, and retention settings.",
@@ -39,7 +44,6 @@ window.__ModuleLoader__.load({
       restartStatic: "Stored immediately — applied on the next dsh web start.",
       restartSaved: "Saved. Restart dsh web to apply.",
       loading: "Loading Graph Memory settings…",
-      overridden: "overridden",
       reset: "Reset",
       caution: "caution",
       showAdvanced: "Show advanced settings ({count})",
@@ -59,9 +63,15 @@ window.__ModuleLoader__.load({
       f_extractionEnabled_label: "Learn from new conversations",
       f_extractionEnabled_hint:
         "When on, each finished turn is summarized into memory by the extraction model. Turn off to stop automatic learning — gm_record still works.",
-      f_recallEnabled_label: "Recall memories automatically",
+      f_recallEnabled_label: "Put memory into the context",
       f_recallEnabled_hint:
-        "When on, relevant memories from earlier sessions are injected before every message. Turn off to stop injection — gm_search still works.",
+        "Master switch for automatic injection. Turn off to stop it entirely — gm_search and gm_record still work.",
+      f_recallCrossSession_label: "Memory from other conversations",
+      f_recallCrossSession_hint:
+        "How far automatic recall may reach into earlier sessions: once when a session starts (default), before every message, or never — leaving them to the gm_search tool. A session already under way is not re-fed them.",
+      f_recallSessionHistory_label: "Restore this conversation's hidden history",
+      f_recallSessionHistory_hint:
+        "When the history takeover below hides older turns of THIS conversation, put the relevant ones back automatically — each one once, and only while it stays hidden. Turn this off only together with the takeover, or the hidden part is gone for good.",
       f_recallMaxNodes_label: "Max memories per recall",
       f_recallMaxNodes_hint:
         "Upper bound on memory nodes one automatic recall may return. Higher = more context, more tokens.",
@@ -77,9 +87,9 @@ window.__ModuleLoader__.load({
       f_freshTurnCount_label: "Keep recent turns verbatim",
       f_freshTurnCount_hint:
         "The newest N turns stay as native question/answer on the model surface. Older turns are governed by the two rewrite options below.",
-      f_contextCompactionEnabled_label: "Allow history takeover (lossy)",
+      f_contextCompactionEnabled_label: "Fold old history away (lossy)",
       f_contextCompactionEnabled_hint:
-        "Lets Graph Memory replace the older model-surface history with recalled material; the model never sees that history again. Refused while recall or learning is off.",
+        "Lets Graph Memory replace the older model-surface history with recalled material; the model never sees that history verbatim again. Refused unless learning, recall and 'restore this conversation's hidden history' are all on.",
       f_projectCompletedTurnTools_label: "Hide tool traces from the model",
       f_projectCompletedTurnTools_hint:
         "Removes completed-turn tool and reasoning traces from the model surface, keeping only the question and the final answer. The hidden trace stays in the durable log.",
@@ -129,12 +139,33 @@ window.__ModuleLoader__.load({
       o_assistantTools_none: "none — automatic recall only",
       o_assistantTools_search: "search — expose gm_search",
       o_assistantTools_all: "all — also expose the admin tools",
+      o_recallCrossSession_firstTurn: "first message only — read them once at session start",
+      o_recallCrossSession_everyTurn: "every message — keep pulling them in",
+      o_recallCrossSession_never: "never — leave them to gm_search",
       o_keep_all: "all — never delete raw messages",
       o_keep_referenced: "referenced — delete unreferenced only",
       o_keep_recent: "recent — delete outside the window",
+
+      chainHint: "Linked — change one and the others stay optimal.",
+      autoTag: "adjusted",
+      resetHint: "Overridden in your profile — click to return the default.",
+      restoreOptimal: "Restore optimal settings",
+      restoreOptimalHint:
+        "Applies the validated combination: history takeover on, tool traces hidden, other conversations read at session start, this conversation's hidden history restored, five recent turns, and a bounded recall size.",
+      chainReason_takeover:
+        "History takeover needs learning and recall on, and 'restore this conversation's hidden history' enabled, or the hidden part can never come back.",
+      chainReason_noTakeover:
+        "Without a working recall path the takeover is refused, so it is switched off.",
+      chainReason_budget:
+        "{window} recent turns → {nodes} memories per recall, so the total stays bounded.",
+      chainReason_firstTurn:
+        "Reading other conversations once never accumulates, so the size is capped rather than shrunk.",
+      chainReason_dryRun:
+        "Preview first: dry run stays on until you turn it off deliberately.",
     };
 
     const zh = {
+      title: "Graph Memory",
       description:
         "记忆层学习什么、召回什么、保留什么。取值保存在配置档案的设置文档中；cordis.patch.yml 仍作为基础层。",
       subtitle: "学习、召回与保留设置。",
@@ -142,7 +173,6 @@ window.__ModuleLoader__.load({
       restartStatic: "立即保存 —— 下次启动 dsh web 时生效。",
       restartSaved: "已保存。重启 dsh web 后生效。",
       loading: "正在载入 Graph Memory 设置…",
-      overridden: "已覆盖",
       reset: "重置",
       caution: "谨慎",
       showAdvanced: "显示高级设置（{count} 项）",
@@ -162,9 +192,15 @@ window.__ModuleLoader__.load({
       f_extractionEnabled_label: "从新对话中学习",
       f_extractionEnabled_hint:
         "开启后，每个已完成的轮次由提取模型总结进记忆。关闭即停止自动学习 —— gm_record 仍然可用。",
-      f_recallEnabled_label: "自动召回记忆",
+      f_recallEnabled_label: "把记忆放入上下文",
       f_recallEnabled_hint:
-        "开启后，来自以往会话的相关记忆会在每条消息前注入。关闭即停止注入 —— gm_search 仍然可用。",
+        "自动注入的总开关。关闭即完全停止注入 —— gm_search 与 gm_record 仍然可用。",
+      f_recallCrossSession_label: "来自其他对话的记忆",
+      f_recallCrossSession_hint:
+        "自动召回可以触及以往会话的程度：会话开始时一次（默认）、每条消息、或从不 —— 交由 gm_search 工具。已经开始的会话不会再次注入。",
+      f_recallSessionHistory_label: "恢复本对话被隐藏的历史",
+      f_recallSessionHistory_hint:
+        "当下面的历史接管隐藏了本对话较早的轮次时，自动把相关轮次放回来 —— 每一条只放一次，且仅在它仍被隐藏期间。请只与接管一起关闭此处，否则被隐藏的部分将永久丢失。",
       f_recallMaxNodes_label: "每次召回的记忆上限",
       f_recallMaxNodes_hint:
         "一次自动召回最多返回的记忆节点数。数值越大，占用的上下文与 token 越多。",
@@ -180,9 +216,9 @@ window.__ModuleLoader__.load({
       f_freshTurnCount_label: "原样保留最近轮次",
       f_freshTurnCount_hint:
         "最近 N 轮以原生问答形式保留在模型上下文中；更早的轮次由下面两个改写选项决定。",
-      f_contextCompactionEnabled_label: "允许接管历史（有损）",
+      f_contextCompactionEnabled_label: "收起旧历史（有损）",
       f_contextCompactionEnabled_hint:
-        "允许 Graph Memory 用召回内容替换较早的模型上下文；模型将不再看到那段历史。召回或学习关闭时会被拒绝。",
+        "允许 Graph Memory 用召回内容替换较早的模型上下文；模型将不再逐字看到那段历史。只有在学习、召回与“恢复本对话被隐藏的历史”都开启时才可用。",
       f_projectCompletedTurnTools_label: "对模型隐藏工具轨迹",
       f_projectCompletedTurnTools_hint:
         "从模型上下文中移除已完成轮次的工具与推理轨迹，只保留问题与最终回答。被隐藏的轨迹仍留在持久日志中。",
@@ -224,17 +260,39 @@ window.__ModuleLoader__.load({
       o_assistantTools_none: "none —— 仅自动召回",
       o_assistantTools_search: "search —— 暴露 gm_search",
       o_assistantTools_all: "all —— 另含管理工具",
+      o_recallCrossSession_firstTurn: "仅第一条消息 —— 会话开始时读取一次",
+      o_recallCrossSession_everyTurn: "每条消息 —— 持续注入",
+      o_recallCrossSession_never: "从不 —— 交由 gm_search",
       o_keep_all: "all —— 永不删除原始消息",
       o_keep_referenced: "referenced —— 只删除未被引用的",
       o_keep_recent: "recent —— 删除窗口之外的",
+
+      chainHint: "联动 —— 修改一项，其余保持最优。",
+      autoTag: "已自动调整",
+      resetHint: "已在配置档案中覆盖 —— 点击恢复默认值。",
+      restoreOptimal: "恢复最优设置",
+      restoreOptimalHint:
+        "应用经验证的组合：开启历史接管、隐藏工具轨迹、其他对话仅在会话开始时读取、恢复本对话被隐藏的历史、保留最近五轮，并限制单次召回规模。",
+      chainReason_takeover:
+        "历史接管需要学习与召回开启，并且开启“恢复本对话被隐藏的历史”，否则被隐藏的部分无法再回来。",
+      chainReason_noTakeover: "没有可用的召回路径时接管会被拒绝，因此已将其关闭。",
+      chainReason_budget: "最近 {window} 轮 → 每次召回 {nodes} 条，以保证总量受限。",
+      chainReason_firstTurn: "其他对话只读取一次不会累积，因此只做上限约束，不缩小。",
+      chainReason_dryRun: "先预演：在明确关闭之前保持仅预演。",
     };
 
     // ── field catalogue ─────────────────────────────────────────────────────
 
-    /** `assistantTools` and `messageRetention.keep` need translated options. */
+    /** `assistantTools`, the recall reach and `messageRetention.keep` need translated options. */
     const ASSISTANT_TOOLS = ["none", "search", "all"].map((value) => ({
       value,
       labelKey: `o_assistantTools_${value}`,
+    }));
+    const RECALL_CROSS_SESSION = ["first-turn", "every-turn", "never"].map((value) => ({
+      value,
+      labelKey: `o_recallCrossSession_${value === "first-turn"
+        ? "firstTurn"
+        : value === "every-turn" ? "everyTurn" : "never"}`,
     }));
     const REASONING_EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(
       (value) => ({ value }),
@@ -252,6 +310,19 @@ window.__ModuleLoader__.load({
       // Essentials ─────────────────────────────────────────────────────────
       { group: "essentials", key: "extractionEnabled", path: ["extractionEnabled"], kind: "boolean" },
       { group: "essentials", key: "recallEnabled", path: ["recallEnabled"], kind: "boolean" },
+      {
+        group: "essentials",
+        key: "recallCrossSession",
+        path: ["recallCrossSession"],
+        kind: "select",
+        options: RECALL_CROSS_SESSION,
+      },
+      {
+        group: "essentials",
+        key: "recallSessionHistory",
+        path: ["recallSessionHistory"],
+        kind: "boolean",
+      },
       { group: "essentials", key: "recallMaxNodes", path: ["recallMaxNodes"], kind: "number", min: 1, step: 1 },
       {
         group: "essentials",
@@ -408,6 +479,183 @@ window.__ModuleLoader__.load({
 
     const ESSENTIAL_COUNT = FIELDS.filter((field) => field.group === "essentials").length;
 
+    // ── linked settings ─────────────────────────────────────────────────────
+    // Editing one field can make a related one unwise: a wider retention window
+    // multiplies the per-recall block, a takeover without a recall path hides
+    // history nothing can return. Each rule below runs only for the field the
+    // user actually touched, and its targets are written in the SAME atomic
+    // mutation, so the card never shows a half-applied pair. RECALL_BUDGET and
+    // the formula mirror the host's optimalRecallMaxNodes(): one policy, both
+    // halves.
+
+    const RECALL_BUDGET = 20;
+
+    function optimalRecallNodes(window) {
+      const value = Number(window);
+      if (!Number.isFinite(value) || value < 1) return 6;
+      return Math.min(6, Math.max(1, Math.round(RECALL_BUDGET / value)));
+    }
+
+    function capRecallNodes(value, max) {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return max;
+      return Math.min(max, Math.max(1, Math.round(parsed)));
+    }
+
+    function setPath(root, path, value) {
+      const next = Object.assign({}, root);
+      let cursor = next;
+      for (let index = 0; index < path.length - 1; index += 1) {
+        const key = path[index];
+        cursor[key] = isPlainObject(cursor[key]) ? Object.assign({}, cursor[key]) : {};
+        cursor = cursor[key];
+      }
+      cursor[path[path.length - 1]] = value;
+      return next;
+    }
+
+    const LINKS = [
+      {
+        // Hiding history is only safe when something can put it back. The path
+        // back is this conversation's own recall — NOT a per-turn re-read of
+        // unrelated conversations, which the reach setting above governs.
+        from: ["contextCompactionEnabled"],
+        apply(values) {
+          if (values.contextCompactionEnabled !== true) return [];
+          const ops = [];
+          if (values.extractionEnabled !== true) {
+            ops.push({ path: ["extractionEnabled"], value: true, reason: "chainReason_takeover" });
+          }
+          if (values.recallEnabled !== true) {
+            ops.push({ path: ["recallEnabled"], value: true, reason: "chainReason_takeover" });
+          }
+          if (values.recallSessionHistory !== true) {
+            ops.push({ path: ["recallSessionHistory"], value: true, reason: "chainReason_takeover" });
+          }
+          return ops;
+        },
+      },
+      {
+        // The host refuses the takeover without a recall path; say so here too.
+        from: ["recallEnabled", "extractionEnabled", "recallSessionHistory"],
+        apply(values) {
+          if (values.recallEnabled === true
+            && values.extractionEnabled === true
+            && values.recallSessionHistory !== false) return [];
+          if (values.contextCompactionEnabled !== true) return [];
+          return [{ path: ["contextCompactionEnabled"], value: false, reason: "chainReason_noTakeover" }];
+        },
+      },
+      {
+        // Window up, single injection down: the total stays bounded. Only a
+        // per-message cross-session reach accumulates per turn, so the budget
+        // formula applies there; the other reaches cap the size instead.
+        from: ["freshTurnCount", "recallCrossSession"],
+        apply(values) {
+          if (values.recallCrossSession !== "every-turn") {
+            const capped = capRecallNodes(values.recallMaxNodes, 6);
+            if (values.recallMaxNodes === capped) return [];
+            return [{ path: ["recallMaxNodes"], value: capped, reason: "chainReason_firstTurn" }];
+          }
+          const next = optimalRecallNodes(values.freshTurnCount);
+          if (values.recallMaxNodes === next) return [];
+          return [{
+            path: ["recallMaxNodes"],
+            value: next,
+            reason: "chainReason_budget",
+            params: { window: values.freshTurnCount, nodes: next },
+          }];
+        },
+      },
+      {
+        from: ["messageRetention.keep"],
+        apply(values) {
+          const keep = readPath(values, ["messageRetention", "keep"]);
+          if (keep === undefined || keep === "all") return [];
+          if (readPath(values, ["messageRetention", "dryRun"]) === true) return [];
+          return [{ path: ["messageRetention", "dryRun"], value: true, reason: "chainReason_dryRun" }];
+        },
+      },
+    ];
+
+    /** Chains drawn with a brace; order inside a group is the render order. */
+    const CHAIN_GROUPS = [
+      ["contextCompactionEnabled", "recallEnabled", "extractionEnabled", "recallSessionHistory"],
+      ["freshTurnCount", "recallMaxNodes"],
+      ["messageRetention.keep", "messageRetention.dryRun"],
+    ];
+
+    /** Field lookup by path key, used to place a chain row in a group. */
+    const FIELD_BY_PATH = new Map(FIELDS.map((field) => [pathKey(field.path), field]));
+    const GROUP_INDEX = new Map(GROUPS.map((group, index) => [group.id, index]));
+
+    /**
+     * Where a chain is drawn: the earliest (least advanced) group any member
+     * belongs to. A chain linking an essential field to an advanced one must
+     * not hide the essential half behind the advanced toggle.
+     */
+    function chainOwner(members) {
+      let owner;
+      let best = Number.MAX_SAFE_INTEGER;
+      for (const key of members) {
+        const field = FIELD_BY_PATH.get(key);
+        if (field === undefined) continue;
+        const index = GROUP_INDEX.get(field.group);
+        if (index !== undefined && index < best) {
+          best = index;
+          owner = field.group;
+        }
+      }
+      return owner;
+    }
+
+    /**
+     * Resolve the chain reachable from `changedKey`, applying each rule to a
+     * working copy so later rules see earlier results. Bounded so a future rule
+     * cycle cannot loop the card.
+     */
+    function linkedOps(values, changedKey, skipKeys) {
+      let working = values;
+      const emitted = [];
+      const seen = new Set(skipKeys);
+      let queue = [changedKey];
+      let guard = 0;
+      while (queue.length && guard < 8) {
+        guard += 1;
+        const nextQueue = [];
+        for (const key of queue) {
+          for (const rule of LINKS) {
+            if (!rule.from.includes(key)) continue;
+            for (const op of rule.apply(working)) {
+              const target = pathKey(op.path);
+              if (seen.has(target)) continue;
+              seen.add(target);
+              working = setPath(working, op.path, op.value);
+              emitted.push(op);
+              nextQueue.push(target);
+            }
+          }
+        }
+        queue = nextQueue;
+      }
+      return emitted;
+    }
+
+    /** The validated combination, mirroring the host's optimalSettingsPatch(). */
+    function optimalValues() {
+      return {
+        extractionEnabled: true,
+        recallEnabled: true,
+        contextCompactionEnabled: true,
+        projectCompletedTurnTools: true,
+        recallCrossSession: "first-turn",
+        recallSessionHistory: true,
+        freshTurnCount: 5,
+        recallMaxNodes: optimalRecallNodes(5),
+        assistantTools: "all",
+      };
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     function isPlainObject(value) {
@@ -436,12 +684,6 @@ window.__ModuleLoader__.load({
       return path.join(".");
     }
 
-    function writeField(scope, path, value) {
-      return path.length === 1
-        ? scope.set(path[0], value)
-        : scope.mutate([{ op: "set", path, value }]);
-    }
-
     function clearField(scope, path) {
       return path.length === 1
         ? scope.unset(path[0])
@@ -461,36 +703,11 @@ window.__ModuleLoader__.load({
     // ── presentation ────────────────────────────────────────────────────────
 
     const styles = {
-      card: {
-        listStyle: "none",
-        border: "1px solid var(--dsh-border, rgba(127,127,127,0.25))",
-        borderRadius: "10px",
-        margin: "0 0 12px",
-        overflow: "hidden",
-      },
-      header: {
-        display: "flex",
-        alignItems: "center",
-        gap: "10px",
-        width: "100%",
-        boxSizing: "border-box",
-        textAlign: "left",
-        padding: "12px 14px",
-        background: "none",
-        border: "none",
-        color: "inherit",
-        font: "inherit",
-        cursor: "pointer",
-      },
-      headText: { display: "flex", flexDirection: "column", gap: "2px", flex: 1 },
-      title: { fontSize: "14px", fontWeight: 600 },
       subtitle: { fontSize: "12px", opacity: 0.72, lineHeight: 1.4 },
-      chevron: { fontSize: "12px", opacity: 0.7 },
-      body: {
+      pageBody: {
         display: "flex",
         flexDirection: "column",
         gap: "10px",
-        padding: "0 14px 14px",
       },
       description: { margin: 0, fontSize: "12px", opacity: 0.72, lineHeight: 1.45 },
       notice: {
@@ -525,19 +742,19 @@ window.__ModuleLoader__.load({
         letterSpacing: "0.04em",
         opacity: 0.65,
       },
-      field: { display: "flex", flexDirection: "column", gap: "3px" },
-      labelRow: { display: "flex", alignItems: "center", gap: "8px" },
-      label: { fontSize: "13px", fontWeight: 500 },
-      hint: { fontSize: "11.5px", opacity: 0.66, lineHeight: 1.4 },
-      tag: {
-        fontSize: "10.5px",
-        textTransform: "uppercase",
-        letterSpacing: "0.04em",
-        opacity: 0.7,
-        border: "1px solid currentColor",
-        borderRadius: "999px",
-        padding: "1px 6px",
+      // One wrapping header: the label takes what it needs and a chip that no
+      // longer fits drops to the next line inside the box instead of pushing
+      // past its border. A four-across chain box is ~190px wide, so this is the
+      // normal case, not the exception.
+      header: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px" },
+      label: {
+        flex: "1 1 120px",
+        fontSize: "12.5px",
+        fontWeight: 600,
+        lineHeight: 1.35,
+        overflowWrap: "anywhere",
       },
+      hint: { fontSize: "11.5px", opacity: 0.66, lineHeight: 1.4 },
       dangerTag: {
         fontSize: "10.5px",
         textTransform: "uppercase",
@@ -578,15 +795,53 @@ window.__ModuleLoader__.load({
         cursor: "pointer",
         color: "inherit",
       },
+      rows: { display: "flex", flexDirection: "column", gap: "10px" },
+      // One chain row: member boxes joined by drawn chain segments.
+      row: { display: "flex", flexDirection: "row", alignItems: "stretch", flexWrap: "wrap" },
+      chainBlock: { display: "flex", flexDirection: "column", gap: "3px" },
+      chainNoteRow: { display: "flex", alignItems: "flex-start", gap: "6px" },
+      node: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "6px",
+        flex: "1 1 190px",
+        minWidth: "175px",
+        maxWidth: "460px",
+        padding: "9px 11px",
+        border: "1px solid var(--dsh-border, rgba(127,127,127,0.35))",
+        borderRadius: "10px",
+        background: "rgba(127,127,127,0.05)",
+        boxSizing: "border-box",
+      },
+      nodeSingle: { flex: "1 1 100%", maxWidth: "none" },
+      linkCell: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: "32px",
+        padding: "0 2px",
+      },
+      chainNote: { fontSize: "11px", opacity: 0.6, lineHeight: 1.4 },
+      autoTag: {
+        fontSize: "10.5px",
+        textTransform: "uppercase",
+        letterSpacing: "0.04em",
+        border: "1px solid rgba(70,150,220,0.6)",
+        color: "rgb(70,150,220)",
+        borderRadius: "999px",
+        padding: "1px 6px",
+      },
+      autoNote: { fontSize: "11px", color: "rgb(70,150,220)", opacity: 0.9, lineHeight: 1.4 },
+      restoreRow: { display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-start" },
     };
 
     function fieldControlId(path) {
       return `gm-config-${pathKey(path).replace(/\./g, "-")}`;
     }
 
-    /** One editable row: label, control, hint, and the override marker. */
+    /** One setting inside its own box: label, control, hint, override and adjustment marks. */
     function FieldRow(props) {
-      const { field, value, overridden, disabled, draft, onDraft, onCommit, onReset, t } = props;
+      const { field, value, overridden, disabled, draft, variant, adjusted, onDraft, onCommit, onReset, t } = props;
       const id = fieldControlId(field.path);
       const label = t(`f_${field.key}_label`);
       const hint = t(`f_${field.key}_hint`);
@@ -639,25 +894,87 @@ window.__ModuleLoader__.load({
         }));
       }
 
+      // Chips: only what the drawing cannot say. The chain segments between the
+      // boxes already show which fields are linked, so a per-field "linked"
+      // pill would be noise; the "overridden" word is implied by the Reset
+      // button, which exists only for an overridden field.
+      const meta = [];
+      if (field.danger) {
+        meta.push(h("span", { key: "caution", style: styles.dangerTag, "data-gm-chip": "" }, t("caution")));
+      }
+      if (adjusted === true) {
+        meta.push(h("span", { key: "adjusted", style: styles.autoTag, "data-gm-chip": "" }, t("autoTag")));
+      }
+      if (overridden) {
+        meta.push(h("button", {
+          key: "reset",
+          type: "button",
+          style: styles.reset,
+          disabled,
+          title: t("resetHint"),
+          "data-gm-chip": "",
+          onClick: () => { onReset(field.path); },
+        }, t("reset")));
+      }
+
       return h(
         "div",
-        { style: styles.field },
-        h(
-          "div",
-          { style: styles.labelRow },
-          h("label", { htmlFor: id, style: styles.label }, label),
-          field.danger ? h("span", { style: styles.dangerTag }, t("caution")) : null,
-          overridden ? h("span", { style: styles.tag }, t("overridden")) : null,
-          overridden
-            ? h("button", { type: "button", style: styles.reset, disabled, onClick: () => { onReset(field.path); } }, t("reset"))
-            : null,
-        ),
+        {
+          style: variant === "chain" ? styles.node : Object.assign({}, styles.node, styles.nodeSingle),
+          "data-gm-field": pathKey(field.path),
+          "data-gm-chain": variant === "chain" ? "1" : "0",
+        },
+        h("div", { style: styles.header }, [h("label", { key: "label", htmlFor: id, style: styles.label, "data-gm-label": "" }, label)].concat(meta)),
         field.kind === "boolean" ? h("div", { style: styles.checkboxRow }, control) : control,
         h("span", { style: styles.hint }, hint),
       );
     }
 
-    /** The Graph Memory settings card. */
+    /** The drawn segment between two linked settings; lit when it just pulled a value. */
+    function chainSvg(width, color, opacity) {
+      const count = Math.floor((width - 3) / 13);
+      return h(
+        "svg",
+        { width, height: 16, viewBox: `0 0 ${width} 16`, focusable: "false", style: { opacity } },
+        Array.from({ length: count }, (_unused, index) => h("rect", {
+          key: index,
+          x: index * 13,
+          y: 3.5,
+          width: 16,
+          height: 9,
+          rx: 4.5,
+          fill: "none",
+          stroke: color,
+          strokeWidth: 1.2,
+        })),
+      );
+    }
+
+    /** Standalone chain mark standing before a chain's caption. */
+    function ChainMark(props) {
+      return h(
+        "span",
+        { style: { display: "flex", alignItems: "center", flex: "0 0 auto" }, "aria-hidden": "true" },
+        chainSvg(30, "currentColor", 0.65),
+      );
+    }
+
+    /** One drawn chain segment between two linked settings; lit when it just pulled a value. */
+    function ChainLink(props) {
+      const active = props.active === true;
+      const color = active ? "rgb(70,150,220)" : "currentColor";
+      return h(
+        "div",
+        {
+          style: Object.assign({}, styles.linkCell, { color, opacity: active ? 0.95 : 0.5 }),
+          title: props.t("chainHint"),
+          "data-gm-link": active ? "active" : "idle",
+        },
+        chainSvg(42, color, 1),
+      );
+    }
+
+    /** The Graph Memory settings card: one-liner for the card list, form for its page. */
     function GraphMemoryCard(props) {
       const scope = props.scope;
       const t = props.t !== undefined ? props.t : (key) => key;
@@ -666,8 +983,12 @@ window.__ModuleLoader__.load({
       const [saved, setSaved] = React.useState(false);
       const [error, setError] = React.useState(null);
       const [advanced, setAdvanced] = React.useState(false);
-      const [open, setOpen] = React.useState(false);
+      // Fields the chain just changed, keyed by path → the reason to show.
+      const [adjustments, setAdjustments] = React.useState({});
 
+      // The Plugins page draws the card's title, icon, and crumb itself and
+      // asks the entry for the one-liner beside the title, then for the body.
+      if (props.view === "summary") return h("span", null, t("subtitle"));
       if (snapshot.status === "unavailable") return null;
       const value = snapshot.value;
       const ready = snapshot.status === "ready" && isPlainObject(value);
@@ -701,13 +1022,32 @@ window.__ModuleLoader__.load({
           }
         }
         setError(null);
-        const request = payload === undefined ? clearField(scope, path) : writeField(scope, path, payload);
-        Promise.resolve(request).then(
+
+        // One atomic mutation: the touched field plus everything its chain
+        // adjusts. Writing them together keeps the stored pair consistent and
+        // shares a single revision fence.
+        const changedKey = pathKey(path);
+        const staged = payload === undefined
+          ? (isPlainObject(value) ? value : {})
+          : setPath(isPlainObject(value) ? value : {}, path, payload);
+        const linked = payload === undefined ? [] : linkedOps(staged, changedKey, [changedKey]);
+        const ops = [];
+        ops.push(payload === undefined ? { op: "unset", path } : { op: "set", path, value: payload });
+        for (const op of linked) ops.push({ op: "set", path: op.path, value: op.value });
+
+        const nextAdjustments = Object.assign({}, adjustments);
+        delete nextAdjustments[changedKey];
+        for (const op of linked) {
+          nextAdjustments[pathKey(op.path)] = { reason: op.reason, params: op.params };
+        }
+        setAdjustments(nextAdjustments);
+
+        Promise.resolve(scope.mutate(ops)).then(
           () => {
             setSaved(true);
             setDrafts((current) => {
               const nextDrafts = Object.assign({}, current);
-              delete nextDrafts[pathKey(path)];
+              delete nextDrafts[changedKey];
               return nextDrafts;
             });
           },
@@ -717,33 +1057,116 @@ window.__ModuleLoader__.load({
 
       function reset(path) {
         setError(null);
+        const nextAdjustments = Object.assign({}, adjustments);
+        delete nextAdjustments[pathKey(path)];
+        setAdjustments(nextAdjustments);
         Promise.resolve(clearField(scope, path)).then(
           () => { setSaved(true); },
           (reason) => { setError(reason && reason.message ? reason.message : String(reason)); },
         );
       }
 
+      /** Put the whole validated combination back in one write. */
+      function restoreOptimal() {
+        setError(null);
+        const ops = Object.entries(optimalValues()).map(([key, next]) => ({
+          op: "set",
+          path: [key],
+          value: next,
+        }));
+        setAdjustments({});
+        setDrafts({});
+        Promise.resolve(scope.mutate(ops)).then(
+          () => { setSaved(true); },
+          (reason) => { setError(reason && reason.message ? reason.message : String(reason)); },
+        );
+      }
+
+      /** Render one setting box; `variant` decides its width inside a row. */
+      function renderField(field, variant) {
+        const key = pathKey(field.path);
+        const adjustment = adjustments[key];
+        return h(FieldRow, {
+          key,
+          field,
+          value,
+          overridden: hasPath(user, field.path),
+          disabled,
+          draft: drafts[key],
+          variant,
+          adjusted: adjustment !== undefined,
+          onDraft: (draftKey, text) => { setDrafts((current) => Object.assign({}, current, { [draftKey]: text })); },
+          onCommit: commit,
+          onReset: reset,
+          t,
+        });
+      }
+
+      // Rows are drawn per group: a chain goes to the earliest group any of its
+      // members belongs to, so an essential field linked to an advanced one is
+      // never hidden behind the advanced toggle. A member claimed by a chain
+      // row is not drawn a second time on its own.
       const rows = [];
+      const consumed = new Set();
       for (const group of ready ? GROUPS : []) {
-        const fields = FIELDS.filter((field) => field.group === group.id);
-        if (fields.length === 0) continue;
         if (group.id !== "essentials" && !advanced) continue;
+        const groupFields = FIELDS.filter((field) => field.group === group.id);
+        const chains = CHAIN_GROUPS
+          .map((members) => members.filter((key) => FIELD_BY_PATH.has(key)))
+          .filter((members) => members.length > 1 && chainOwner(members) === group.id);
+
+        const items = [];
+        for (const field of groupFields) {
+          const key = pathKey(field.path);
+          if (consumed.has(key)) continue;
+          const chain = chains.find((members) => members.includes(key));
+          if (chain === undefined) {
+            consumed.add(key);
+            items.push({ kind: "single", key, field });
+            continue;
+          }
+          for (const member of chain) consumed.add(member);
+          items.push({ kind: "chain", key: `chain:${chain.join("+")}`, members: chain });
+        }
+        if (items.length === 0) continue;
+
         if (group.id !== "essentials") {
           rows.push(h("p", { key: `t-${group.id}`, style: styles.groupTitle }, t(`group_${group.id}`)));
         }
-        for (const field of fields) {
-          rows.push(h(FieldRow, {
-            key: pathKey(field.path),
-            field,
-            value,
-            overridden: hasPath(user, field.path),
-            disabled,
-            draft: drafts[pathKey(field.path)],
-            onDraft: (key, text) => { setDrafts((current) => Object.assign({}, current, { [key]: text })); },
-            onCommit: commit,
-            onReset: reset,
-            t,
-          }));
+        for (const item of items) {
+          if (item.kind === "single") {
+            rows.push(renderField(item.field, "single"));
+            continue;
+          }
+          const members = item.members
+            .map((key) => FIELD_BY_PATH.get(key))
+            .filter((field) => field !== undefined);
+          const notes = members
+            .map((field) => adjustments[pathKey(field.path)])
+            .filter((adjustment) => adjustment !== undefined)
+            .map((adjustment) => t(adjustment.reason, adjustment.params || {}));
+          const parts = [];
+          members.forEach((field, index) => {
+            if (index > 0) {
+              const lit = [members[index - 1], field]
+                .some((entry) => adjustments[pathKey(entry.path)] !== undefined);
+              parts.push(h(ChainLink, { key: `link:${index}`, active: lit, t }));
+            }
+            parts.push(renderField(field, "chain"));
+          });
+          rows.push(h(
+            "div",
+            { key: item.key, style: styles.chainBlock },
+            h("div", { style: styles.row }, parts),
+            h(
+              "div",
+              { style: styles.chainNoteRow, "data-gm-chain-note": item.key },
+              h(ChainMark, {}),
+              h("span", { style: notes.length > 0 ? styles.autoNote : styles.chainNote }, notes.length > 0
+                ? notes.join(" ")
+                : t("chainHint")),
+            ),
+          ));
         }
       }
 
@@ -752,6 +1175,17 @@ window.__ModuleLoader__.load({
           h("p", { key: "description", style: styles.description }, t("description")),
           h("div", { key: "notice", style: saved ? styles.noticeSaved : styles.notice }, t(saved ? "restartSaved" : "restartStatic")),
           error ? h("div", { key: "error", style: styles.error }, error) : null,
+          h("div", { key: "restore", style: styles.restoreRow }, [
+            h("button", {
+              key: "restore-button",
+              type: "button",
+              style: styles.advancedToggle,
+              disabled,
+              title: t("restoreOptimalHint"),
+              onClick: restoreOptimal,
+            }, t("restoreOptimal")),
+            h("span", { key: "restore-hint", style: styles.hint }, t("restoreOptimalHint")),
+          ]),
           h("button", {
             key: "advanced",
             type: "button",
@@ -759,52 +1193,56 @@ window.__ModuleLoader__.load({
             "aria-expanded": advanced,
             onClick: () => { setAdvanced(!advanced); },
           }, advanced ? t("hideAdvanced") : t("showAdvanced", { count: FIELDS.length - ESSENTIAL_COUNT })),
-          ...rows,
+          h("div", { key: "rows", style: styles.rows }, rows),
         ]
         : h("span", { style: styles.hint }, t("loading"));
 
-      return h(
-        "li",
-        { style: styles.card },
-        h("button", {
-          type: "button",
-          style: styles.header,
-          "aria-expanded": open,
-          "aria-label": `Graph Memory: ${open ? "collapse" : "expand"}`,
-          onClick: () => { setOpen(!open); },
-        },
-          h("span", { style: styles.headText },
-            h("span", { style: styles.title }, "Graph Memory"),
-            h("span", { style: styles.subtitle }, t("subtitle")),
-          ),
-          saved ? h("span", { style: styles.tag }, t("restartTag")) : null,
-          h("span", { style: styles.chevron, "aria-hidden": true }, open ? "▾" : "▸"),
-        ),
-        open ? h("div", { style: styles.body }, body) : null,
-      );
+      return h("div", { style: styles.pageBody }, body);
     }
 
     // ── plugin entry ────────────────────────────────────────────────────────
 
-    const inject = ["slots", "settingsScope", "locale"];
+    const inject = ["slots", "configForms", "locale"];
 
-    /** Register the dictionaries and the settings card. */
+    /**
+     * Package the Host keys a bundle's own configuration by: the bundle whose
+     * page the Plugins list opens. It is the installed package name, not the
+     * settings namespace. `plugins.item` is reserved for the official settings
+     * pages, so a Community bundle's configuration belongs here instead.
+     */
+    const BUNDLE_PACKAGE = "graph-memory";
+
+    /** Register the dictionaries and the bundle's configuration section. */
     function apply(ctx) {
       const locale = ctx.locale;
       if (locale !== undefined && typeof locale.register === "function") {
         ctx.effect(() => locale.register(NS, { zh, en }), "graph-memory: settings dictionaries");
       }
-      const scope = ctx.settingsScope.bind({ namespace: NS });
-      return ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
-        name: "settings.plugin.item",
-        key: NS,
+      const scope = ctx.configForms.get(NS);
+      // The card is the configuration of the `graph-memory` bundle: it
+      // registers into `plugins.bundle.config` under that package name and the
+      // Plugins list renders it on the bundle's own page, opened from the
+      // bundle's card. Gating on the Host serving the namespace keeps an
+      // unserved entry from showing an empty section. The page supplies no
+      // `form` for a bundle, so the card keeps its own scope.
+      return ctx.effect(() => ctx.configForms.whileServed([NS], () => ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register({
+        name: "plugins.bundle.config",
+        key: BUNDLE_PACKAGE,
         locale: NS,
         inject: () => ({ scope }),
-      }, GraphMemoryCard));
+      }, GraphMemoryCard))), "graph-memory: bundle configuration");
     }
 
     module.exports.apply = apply;
     module.exports.inject = inject;
+    // Internal test seam: the linkage policy is exercised headlessly by
+    // test/dsh-settings-card.test.ts. Not part of the plugin API.
+    module.exports.__chainPolicy = {
+      CHAIN_GROUPS,
+      optimalRecallNodes,
+      optimalValues,
+      linkedOps,
+    };
     return module.exports;
   },
 });

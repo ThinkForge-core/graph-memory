@@ -360,12 +360,15 @@ export function saveMessageOnce(db, eventId, sid, turn, role, content) {
  * one user question and one final assistant answer for each completed turn.
  */
 export function getNextUnextractedTurn(db, sid, completedTurn) {
+    // A failed attempt schedules its own retry time; the backlog drainer must
+    // respect it, or a scheduled backoff would be retried immediately.
     const next = db.prepare(`
     SELECT MIN(turn_index) AS turn_index
     FROM gm_messages
     WHERE session_id=? AND extracted=0 AND extraction_state='pending'
       AND turn_index<=?
-  `).get(sid, completedTurn);
+      AND (extraction_next_retry_at IS NULL OR extraction_next_retry_at<=?)
+  `).get(sid, completedTurn, Date.now());
     if (next?.turn_index === null || next?.turn_index === undefined)
         return [];
     return db.prepare(`
@@ -432,6 +435,17 @@ export function recordExtractionFailure(db, ids, error, nextRetryAt) {
   `).run(error.slice(0, 2_000), nextRetryAt, Date.now(), ...ids);
     return Number(result.changes);
 }
+/** Highest recorded attempt count across one turn's durable messages. */
+export function getExtractionAttempts(db, ids) {
+    if (!ids.length)
+        return 0;
+    const row = db.prepare(`
+    SELECT MAX(extraction_attempts) AS attempts
+    FROM gm_messages
+    WHERE id IN (${messageIdPlaceholders(ids)})
+  `).get(...ids);
+    return Number(row?.attempts ?? 0);
+}
 /** A poison message remains durable and explicitly unlearned until retried. */
 export function quarantineMessages(db, ids, error) {
     if (!ids.length)
@@ -459,6 +473,43 @@ export function requeueQuarantined(db, sid) {
         WHERE extraction_state='quarantined'
       `).run(Date.now());
     return Number(result.changes);
+}
+/**
+ * Report whether one completed turn has already been summarized.
+ *
+ * `ready` means every durable message of that turn was extracted successfully,
+ * so the turn capsule exists and recall can put the turn back after it leaves
+ * the model surface. `missing` means the host captured no durable Q/A pair at
+ * all: there is nothing to learn and nothing to wait for. Anything mixed (one
+ * message pending or quarantined) stays `pending` and must not be archived.
+ */
+export function getTurnExtractionReadiness(db, sid, turn) {
+    if (!Number.isInteger(turn) || turn < 1)
+        return "missing";
+    const rows = db.prepare(`
+    SELECT extraction_state AS state, COUNT(*) AS count
+    FROM gm_messages
+    WHERE session_id=? AND turn_index=?
+    GROUP BY extraction_state
+  `).all(sid, turn);
+    if (!rows.length)
+        return "missing";
+    let total = 0;
+    let succeeded = 0;
+    let quarantined = 0;
+    for (const row of rows) {
+        const count = Number(row.count);
+        total += count;
+        if (row.state === "succeeded")
+            succeeded += count;
+        if (row.state === "quarantined")
+            quarantined += count;
+    }
+    if (succeeded === total)
+        return "ready";
+    if (quarantined === total)
+        return "quarantined";
+    return "pending";
 }
 export function getExtractionStats(db) {
     const rows = db.prepare(`

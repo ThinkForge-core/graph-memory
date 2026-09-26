@@ -16,6 +16,8 @@ import {
   getNextUnextractedTurn,
   getUnextractedTurn,
   getExtractionStats,
+  getExtractionAttempts,
+  getTurnExtractionReadiness,
   getPendingSessionIds,
   getExtractionCompletedTurn,
   getNodeSources,
@@ -47,6 +49,7 @@ import {
   selectDshCompletedTurnTraceRange,
 } from "./src/format/dsh-turn-projection.ts";
 import {
+  collectPresentedRecall,
   filterDshRecallMemories,
   filterDshRecallNodes,
   insertDshRecallBeforeCurrentUser,
@@ -59,64 +62,30 @@ import {
   messageRetentionPolicyRevision,
   normalizeMessageRetentionPolicy,
   runMessageRetention,
-  type MessageRetentionConfig,
   type MessageRetentionResult,
 } from "./src/store/retention.ts";
 import {
-  GRAPH_MEMORY_SETTINGS_NAMESPACE,
   GRAPH_MEMORY_SETTINGS_SCHEMA,
-  graphMemorySettingsBase,
-  validateGraphMemorySettings,
+  resolveGraphMemorySettings,
   type GraphMemorySettings,
+  type GraphMemorySettingsInput,
+  type RecallCrossSessionMode,
 } from "./src/settings/schema.ts";
 
 export const name = "graph-memory-dsh";
 export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "sessions", "credentials", "tokenMeter"];
 
-interface DshEmbeddingConfig {
-  apiKeyEnv?: string;
-  baseURL?: string;
-  baseUrl?: string;
-  model?: string;
-  dimensions?: number;
-}
-
-export interface Config {
-  dbPath?: string;
-  extractionEnabled?: boolean;
-  recallEnabled?: boolean;
-  recallMaxNodes?: number;
-  /** Optional embedding-provider-calibrated cosine floor for every recall path. */
-  semanticScoreThreshold?: number;
-  maintenanceInterval?: number;
-  /** Durable raw-message retention. Defaults to keep=all (no deletion). */
-  messageRetention?: MessageRetentionConfig;
-  /** Keep this many newest real user turns as native question/final-answer endpoints on the DSH model surface. */
-  freshTurnCount?: number;
-  /**
-   * Let Graph Memory replace older model-surface history without an LLM call.
-   * Defaults to false. Ignored unless recallEnabled and extractionEnabled are
-   * both true: the archived prefix stays invisible to the model, and only the
-   * recall path can put anything back in its place.
-   */
-  contextCompactionEnabled?: boolean;
-  /**
-   * Hide completed-turn tool traces while retaining the native question and
-   * final answer. Defaults to false: the hidden trace is never replayed to the
-   * model, it survives only in the durable DSH log.
-   */
-  projectCompletedTurnTools?: boolean;
-  /** Tools exposed to the assistant. Automatic recall never depends on a tool call. */
-  assistantTools?: "search" | "all" | "none";
-  /** Dedicated extraction route. When set, it takes precedence over the foreground Agent route. */
-  llmProvider?: string;
-  llmModel?: string;
-  /** Background extraction should normally run without chain-of-thought. */
-  llmReasoningEffort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  /** Optional extraction response cap. Omitted by default. */
-  llmMaxTokens?: number;
-  embedding?: DshEmbeddingConfig;
-}
+/**
+ * Configuration schema for the `graph-memory` profile entry.
+ *
+ * The Loader validates this, layers schema defaults, the `cordis.patch.yml`
+ * composition entry and the user document, then passes the result to
+ * {@link apply}. Because the schema exposes volatile fields, the host serves
+ * the `graph-memory` namespace to the `graph-memory-ui-dsh` Plugins card. Every
+ * field is read once in `apply`, so a stored change takes effect on the next
+ * `dsh web` start — the card says exactly that.
+ */
+export const Config = GRAPH_MEMORY_SETTINGS_SCHEMA;
 
 interface Route {
   provider: string;
@@ -154,6 +123,14 @@ interface DshContext {
     serviceFor(agent: any, key: string): any;
   };
   get?(name: string): any;
+  /**
+   * Cordis dependency injection. Used only to take over the Plugins page
+   * policy for this entry once the `settings` service is available; a
+   * hand-built context in tests may omit it.
+   */
+  inject?(names: string[], callback: (child: any) => void): unknown;
+  /** The plugin's own fiber, used as the settings presentation owner. */
+  fiber?: unknown;
   tokenMeter?: {
     measure(session: unknown): { nodes: ReadonlyArray<{ seq: number; heuristicTokens: number }> };
   };
@@ -169,60 +146,82 @@ const PLUGIN = "graph-memory";
 // v3-to-v4 converter writes for a plugin name: `plugin:<name>`.
 const PRODUCER_KIND = `plugin:${PLUGIN}`;
 
-/** The slice of the DSH settings service this plugin uses. */
-interface SettingsScopeLike<T> {
-  get(): T;
-}
-
-/** Host settings provider, read through `ctx.get("settings")`. */
-interface SettingsProviderLike {
-  register<T>(
-    namespace: string,
-    schema: unknown,
-    options: { base?: unknown; applies?: "live" | "restart"; validate?: (value: T) => void },
-  ): SettingsScopeLike<T>;
-}
+/**
+ * How many turns past the retention window one unsummarized turn may hold the
+ * surface archive open before it is archived anyway.
+ *
+ * A turn whose extraction is still running legitimately waits: the summary is
+ * the only thing that can put it back after it leaves the surface. A turn that
+ * failed into quarantine will never be retried on its own, so waiting forever
+ * would freeze the window and let the session grow again. After this grace the
+ * turn is archived while its raw question/answer pair stays durable, so
+ * `gm_retry_extraction` and `gm_search` can still recover it.
+ */
+const QUARANTINE_GRACE_TURNS = 5;
 
 /**
- * Resolve the configuration the plugin should run with.
+ * Bounded automatic retry for a failed structured extraction.
  *
- * The settings namespace layers schema defaults, the composition entry from
- * `cordis.patch.yml`, and the user document the Settings card writes. Every
- * field is consumed once while the plugin wires itself, so a stored change is
- * picked up on the next `dsh web` start — the card says exactly that.
- *
- * Without a settings service (for example a host that does not compose it)
- * the composition entry is authoritative, as it was before the namespace
- * existed.
- * @param ctx - the plugin context.
- * @param input - the composition entry.
- * @returns the effective configuration.
+ * The extraction contract asks a small local model to call one tool exactly
+ * once; a text answer or a doubled call is a stochastic refusal, not a data
+ * defect, and a second attempt usually succeeds. Retrying is free (no paid
+ * route, no foreground time), but it must stay bounded: after this many
+ * attempts the turn is quarantined and waits for an explicit retry, exactly
+ * as before. Nothing here delays the foreground conversation.
  */
-function resolveSettings(ctx: DshContext, input: Config): Config {
-  const base = graphMemorySettingsBase(input);
-  const settings = ctx.get?.("settings") as SettingsProviderLike | undefined;
-  if (settings === undefined || typeof settings.register !== "function") {
-    // Optional: configuration validation must not depend on a fully
-    // materialized context, and both fields are absent in minimal harnesses.
-    ctx.logger?.warn?.("[graph-memory] settings service unavailable; using the composition configuration");
-    return base as Config;
-  }
-  try {
-    const scope = settings.register<GraphMemorySettings>(
-      GRAPH_MEMORY_SETTINGS_NAMESPACE,
-      GRAPH_MEMORY_SETTINGS_SCHEMA,
-      { base, applies: "restart", validate: validateGraphMemorySettings },
-    );
-    ctx.logger?.info?.(
-      `[graph-memory] settings namespace "${GRAPH_MEMORY_SETTINGS_NAMESPACE}" registered (applies on restart)`,
-    );
-    return scope.get() as Config;
-  } catch (error) {
-    ctx.logger?.warn?.(
-      `[graph-memory] settings registration failed, using the composition configuration: ${String(error)}`,
-    );
-    return base as Config;
-  }
+const AUTORETRY_MAX_ATTEMPTS = 3;
+const AUTORETRY_DELAY_MS = 30_000;
+const AUTORETRY_TICK_MS = 30_000;
+
+/**
+ * Revision of the validated optimal preset.
+ *
+ * Bump this whenever the recommended combination changes. On a start whose
+ * stored `appliedOptimalRevision` differs, the plugin writes the preset into
+ * the profile settings once and applies it to the running instance, so a
+ * reinstall lands on the optimal configuration without hand-clicking. Between
+ * revisions nothing is written, so a deliberate user edit survives.
+ */
+export const OPTIMAL_SETTINGS_REVISION = "2026-09-26.2";
+
+/**
+ * Recall-size budget shared with the settings card's chain rule.
+ *
+ * A per-turn recall snapshot stays on the surface until rolling compaction
+ * archives it, so up to `freshTurnCount` snapshots can be live at once. A
+ * larger retention window therefore has to carry a smaller single injection,
+ * or the total budget grows with the window. Kept at 20 for both halves; the
+ * card shows the same formula as a visible chain, this side applies it.
+ */
+export function optimalRecallMaxNodes(freshTurnCount: number): number {
+  if (!Number.isFinite(freshTurnCount) || freshTurnCount < 1) return 6;
+  return Math.min(6, Math.max(1, Math.round(20 / freshTurnCount)));
+}
+
+/** The validated optimal configuration, stamped by {@link OPTIMAL_SETTINGS_REVISION}. */
+export function optimalSettingsPatch(): GraphMemorySettingsInput {
+  const freshTurnCount = 5;
+  return {
+    extractionEnabled: true,
+    recallEnabled: true,
+    // History takeover needs a path that can put hidden turns back. That path is
+    // the session's own recall, not a per-turn re-read of unrelated
+    // conversations: other sessions are welcome once, at session start, and the
+    // hidden part of this session stays recoverable for as long as it is hidden.
+    contextCompactionEnabled: true,
+    projectCompletedTurnTools: true,
+    recallCrossSession: "first-turn",
+    recallSessionHistory: true,
+    freshTurnCount,
+    recallMaxNodes: optimalRecallMaxNodes(freshTurnCount),
+    // Automatic recall never needs a tool call, but the assistant still needs
+    // the explicit search/record half of the plugin.
+    assistantTools: "all",
+  };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function sessionKey(id: unknown): string {
@@ -262,24 +261,32 @@ function stringOutput(title: string) {
   };
 }
 
-export function apply(ctx: DshContext, input: Config = {}): void {
-  // The composition entry is the base layer; the settings namespace, when the
-  // host composes one, supplies schema defaults and the user's overrides.
-  const effective: Config = resolveSettings(ctx, input);
-  const freshTurnCount = effective.freshTurnCount ?? 5;
+export function apply(ctx: DshContext, input: GraphMemorySettingsInput = {}): void {
+  // The Plugins page draws its own generic auto-form for any entry whose Config
+  // exposes volatile fields. The `graph-memory-ui-dsh` card draws this one, so
+  // take the page policy over to keep a single form on the page.
+  ctx.inject?.(["settings"], (child) => {
+    const settings = child?.settings;
+    if (settings === undefined || typeof settings.configure !== "function") return;
+    child.effect(() => settings.configure({ auto: false }, ctx.fiber));
+  });
+  // The Loader has already layered schema defaults, the composition entry and
+  // the user document; this only unwraps the volatile references it produced.
+  const effective: GraphMemorySettings = resolveGraphMemorySettings(input);
+  let freshTurnCount = effective.freshTurnCount ?? 5;
   if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
     throw new TypeError(`[graph-memory] freshTurnCount must be a positive integer, received ${freshTurnCount}`);
   }
   // Both surface rewrites default to OFF. They are lossless for the durable DSH
   // log but not for the model, which only ever meets the archived prefix again
   // through recall. Opt in explicitly once the recall path is known to work.
-  const contextCompactionRequested = effective.contextCompactionEnabled ?? false;
-  const projectCompletedTurnTools = effective.projectCompletedTurnTools ?? false;
-  const assistantTools = effective.assistantTools ?? "none";
+  let contextCompactionRequested = effective.contextCompactionEnabled ?? false;
+  let projectCompletedTurnTools = effective.projectCompletedTurnTools ?? false;
+  let assistantTools = effective.assistantTools ?? "none";
   if (!["search", "all", "none"].includes(assistantTools)) {
     throw new TypeError(`[graph-memory] assistantTools must be search, all or none, received ${String(assistantTools)}`);
   }
-  const recallMaxNodes = effective.recallMaxNodes ?? DEFAULT_CONFIG.recallMaxNodes;
+  let recallMaxNodes = effective.recallMaxNodes ?? DEFAULT_CONFIG.recallMaxNodes;
   if (!Number.isInteger(recallMaxNodes) || recallMaxNodes < 1) {
     throw new TypeError(`[graph-memory] recallMaxNodes must be a positive integer, received ${recallMaxNodes}`);
   }
@@ -325,25 +332,147 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     semanticScoreThreshold: effective.semanticScoreThreshold ?? DEFAULT_CONFIG.semanticScoreThreshold,
     embedding,
   };
-  const extractionEnabled = effective.extractionEnabled ?? true;
-  const recallEnabled = effective.recallEnabled ?? true;
+  let extractionEnabled = effective.extractionEnabled ?? true;
+  let recallEnabled = effective.recallEnabled ?? true;
+  // Automatic recall draws on two independent sources, configured separately:
+  // other sessions' memory is read at session start by default (any per-turn
+  // reach is opt-in), while this session's own history is restored whenever the
+  // takeover hides it. The retired single switch cannot express that split, so
+  // it is ignored and only reported.
+  let recallCrossSession: RecallCrossSessionMode = effective.recallCrossSession ?? "first-turn";
+  let recallSessionHistory = effective.recallSessionHistory ?? true;
+  if (effective.recallOnFirstTurnOnly !== undefined) {
+    ctx.logger.warn(
+      "[graph-memory] recallOnFirstTurnOnly is deprecated and ignored; it is replaced by " +
+      `recallCrossSession (now "${recallCrossSession}") and recallSessionHistory ` +
+      `(now ${recallSessionHistory}).`,
+    );
+  }
   // Fail-safe: replacing model-surface history is safe only when Graph Memory can
   // put something back in its place. Without recall there is no replacement at
   // all; without extraction the archived turns can never become recallable
-  // memories. Either way the model keeps answering as if the session had just
-  // started, so refuse the takeover instead of silently destroying the context.
-  const contextCompactionEnabled = contextCompactionRequested && recallEnabled && extractionEnabled;
+  // memories; and without the session's own recall path, cross-session memory
+  // alone cannot return a hidden turn of THIS session. Either way the model
+  // keeps answering as if the session had just started, so refuse the takeover
+  // instead of silently destroying the context.
+  let contextCompactionEnabled = contextCompactionRequested
+    && recallEnabled
+    && extractionEnabled
+    && recallSessionHistory;
   if (contextCompactionRequested && !contextCompactionEnabled) {
     const missing = [
       recallEnabled ? null : "recallEnabled=false",
       extractionEnabled ? null : "extractionEnabled=false",
+      recallSessionHistory ? null : "recallSessionHistory=false",
     ].filter((value): value is string => value !== null).join(", ");
     ctx.logger.warn(
       `[graph-memory] contextCompactionEnabled ignored (${missing}): archiving the model surface ` +
       "without a working recall path would hide history with no replacement. " +
-      "Set recallEnabled and extractionEnabled to true to enable rolling compaction.",
+      "Set recallEnabled, extractionEnabled and recallSessionHistory to true to enable rolling compaction.",
     );
   }
+
+  // ── optimal preset ────────────────────────────────────────────────────────
+  // A release carries a revision. On the first start after it the preset is
+  // written into the profile settings exactly once and applied to this running
+  // instance, so a reinstall lands on the optimal configuration without
+  // hand-clicking; between revisions nothing is written and a deliberate edit
+  // survives every ordinary start.
+  let optimalState: "current" | "pending" | "applied" | "unpersisted" =
+    effective.appliedOptimalRevision === OPTIMAL_SETTINGS_REVISION ? "current" : "pending";
+
+  function applyOptimalToRuntime(patch: GraphMemorySettingsInput): string[] {
+    const changed: string[] = [];
+    const note = (name: string, next: unknown, current: unknown) => {
+      if (next !== undefined && next !== current) changed.push(name);
+    };
+    note("contextCompactionEnabled", patch.contextCompactionEnabled, contextCompactionRequested);
+    note("projectCompletedTurnTools", patch.projectCompletedTurnTools, projectCompletedTurnTools);
+    note("extractionEnabled", patch.extractionEnabled, extractionEnabled);
+    note("recallEnabled", patch.recallEnabled, recallEnabled);
+    note("recallCrossSession", patch.recallCrossSession, recallCrossSession);
+    note("recallSessionHistory", patch.recallSessionHistory, recallSessionHistory);
+    note("freshTurnCount", patch.freshTurnCount, freshTurnCount);
+    note("recallMaxNodes", patch.recallMaxNodes, recallMaxNodes);
+    note("assistantTools", patch.assistantTools, assistantTools);
+
+    if (patch.contextCompactionEnabled !== undefined) contextCompactionRequested = patch.contextCompactionEnabled;
+    if (patch.projectCompletedTurnTools !== undefined) projectCompletedTurnTools = patch.projectCompletedTurnTools;
+    if (patch.extractionEnabled !== undefined) extractionEnabled = patch.extractionEnabled;
+    if (patch.recallEnabled !== undefined) recallEnabled = patch.recallEnabled;
+    if (patch.recallCrossSession !== undefined) recallCrossSession = patch.recallCrossSession;
+    if (patch.recallSessionHistory !== undefined) recallSessionHistory = patch.recallSessionHistory;
+    if (patch.freshTurnCount !== undefined) freshTurnCount = patch.freshTurnCount;
+    if (patch.recallMaxNodes !== undefined) {
+      recallMaxNodes = patch.recallMaxNodes;
+      config.recallMaxNodes = recallMaxNodes;
+    }
+    if (patch.assistantTools !== undefined) assistantTools = patch.assistantTools;
+    // Recompute the derived takeover flag exactly as the initial path does.
+    contextCompactionEnabled = contextCompactionRequested
+      && recallEnabled
+      && extractionEnabled
+      && recallSessionHistory;
+    return changed;
+  }
+
+  async function applyOptimalSettings(settings: any): Promise<void> {
+    if (optimalState !== "pending") return;
+    optimalState = "applied";
+    let descriptor: any;
+    try {
+      const descriptors = settings.describe();
+      descriptor = Array.isArray(descriptors)
+        ? descriptors.find((row: any) => row?.ns === "graph-memory")
+        : undefined;
+    } catch (error) {
+      optimalState = "pending";
+      ctx.logger.warn(`[graph-memory] optimal settings could not be read: ${String(error)}`);
+      return;
+    }
+    if (descriptor === undefined) {
+      optimalState = "pending";
+      return;
+    }
+    const patch = optimalSettingsPatch();
+    const changed = applyOptimalToRuntime(patch);
+    effective.appliedOptimalRevision = OPTIMAL_SETTINGS_REVISION;
+    try {
+      await settings.update(
+        "graph-memory",
+        { ...patch, appliedOptimalRevision: OPTIMAL_SETTINGS_REVISION },
+        descriptor.revision,
+      );
+      ctx.logger.info(
+        `[graph-memory] optimal settings applied (revision ${OPTIMAL_SETTINGS_REVISION}); ` +
+        `changed: ${changed.length ? changed.join(", ") : "nothing"}`,
+      );
+    } catch (error) {
+      // Applied to this run but not stored (for example a field pinned by a
+      // --patch overlay): it will be re-applied on the next start.
+      optimalState = "unpersisted";
+      ctx.logger.warn(
+        `[graph-memory] optimal settings applied to this run but not persisted: ${String(error)}`,
+      );
+    }
+  }
+
+  // Registered after the runtime flags above: the injection callback may run
+  // synchronously, so it must not touch them before they exist.
+  ctx.inject?.(["settings"], (child) => {
+    const settings = child?.settings;
+    if (settings === undefined || typeof settings.describe !== "function") return;
+    child.effect(() => {
+      // Deferred a microtask so the write cannot race the Loader settling the
+      // profile entry, yet still lands long before the first user turn.
+      queueMicrotask(() => { void applyOptimalSettings(settings); });
+    });
+  });
+
+  function optimalStatusLine(): string {
+    return `optimal=${OPTIMAL_SETTINGS_REVISION} (${optimalState})`;
+  }
+
   const db = openDb(config.dbPath);
   const recaller = new Recaller(db, config);
   const latestRoute = new Map<string, Route>();
@@ -368,8 +497,22 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     projectedTurns: 0,
     projectedEvents: 0,
     projectedTokens: 0,
+    /** Runs whose prefix stopped before an unsummarized turn. */
+    deferredRuns: 0,
+    /** Completed turns still waiting for their summary. */
+    deferredTurns: 0,
+    /** Ready-check reads that failed; those turns are never archived blindly. */
+    readinessErrors: 0,
   };
   const pendingTurnProjections = new Set<string>();
+  const extractionMetrics = {
+    /** Failures that were rescheduled instead of parked. */
+    retriesScheduled: 0,
+    /** Turns parked after the attempt budget was exhausted. */
+    quarantinedAfterRetries: 0,
+    /** Retry ticks that found due work. */
+    retryTicks: 0,
+  };
   const retentionMetrics = {
     runs: 0,
     dryRuns: 0,
@@ -422,7 +565,18 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         provider: selectedRoute.provider,
         model: selectedRoute.model,
         reasoningEffort: extractionReasoningEffort,
-        system: `${system}\n\nYou must call ${GRAPH_EXTRACTION_TOOL_NAME} exactly once. Do not emit a text response.`,
+        // Extraction is a data contract, not a creative task. A deterministic
+        // sample is the cheapest way to keep a small local model on the schema.
+        temperature: 0,
+        // The extraction system prompt is Chinese and the turn may be in any
+        // language. The binding rule is therefore repeated in English, short
+        // and explicit: a text answer or a second call is a contract failure,
+        // and "nothing new" still means exactly one call with empty triples.
+        system: `${system}\n\n`
+          + `Output contract: call ${GRAPH_EXTRACTION_TOOL_NAME} exactly once. `
+          + "A text answer is a failure; a second call is a failure. "
+          + 'If the turn produced no new knowledge, still call it once with a summary, '
+          + 'an outcome and "triples": [].',
         tools: [GRAPH_EXTRACTION_TOOL],
         ...(effective.llmMaxTokens === undefined ? {} : { maxTokens: effective.llmMaxTokens }),
         signal: controller.signal,
@@ -572,9 +726,26 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         return;
       }
       const error = cause instanceof Error ? cause : new Error(String(cause));
-      recordExtractionFailure(db, ids, error.message, null);
-      quarantineMessages(db, ids, error.message);
-      ctx.logger.warn(`[graph-memory] DSH extraction quarantined turn=${rows[0].turn_index} after one failed structured call`);
+      // A stochastic refusal by the extraction model (a text answer instead of
+      // the tool call, or a doubled call) usually clears on the next attempt.
+      // Retry a bounded number of times before parking the turn; the attempt
+      // count and the next-attempt time are both durable.
+      recordExtractionFailure(db, ids, error.message, Date.now() + AUTORETRY_DELAY_MS);
+      const attempts = getExtractionAttempts(db, ids);
+      if (attempts >= AUTORETRY_MAX_ATTEMPTS) {
+        quarantineMessages(db, ids, error.message);
+        extractionMetrics.quarantinedAfterRetries += 1;
+        ctx.logger.warn(
+          `[graph-memory] DSH extraction quarantined turn=${rows[0].turn_index} ` +
+          `after ${attempts} failed structured calls`,
+        );
+      } else {
+        extractionMetrics.retriesScheduled += 1;
+        ctx.logger.warn(
+          `[graph-memory] DSH extraction failed turn=${rows[0].turn_index} ` +
+          `(attempt ${attempts}/${AUTORETRY_MAX_ATTEMPTS}); retry scheduled in ${AUTORETRY_DELAY_MS} ms`,
+        );
+      }
     }
   }
 
@@ -729,17 +900,48 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   // installed on agent.ctx rather than the host plugin context. Replacement
   // uses DSH's public surface + shadow-price protocol and makes no LLM call.
   async function compactBeforeStep(
-    { agent, messages, signal, step }: any,
+    { agent, messages, signal, step, turn }: any,
     next: () => Promise<any>,
   ) {
     if (contextCompactionEnabled && !closing && !signal?.aborted) {
       try {
         const hasIncomingUser = Array.isArray(messages)
           && messages.some(message => message?.source?.kind === "user");
+        const sid = sessionKey(agent?.session?.id ?? agent?.id);
+        const currentTurn = Number.isInteger(turn) ? Number(turn) : undefined;
+        // Readiness gate: never archive a completed turn before its summary
+        // exists, because the summary is the only thing recall can put back.
+        // This is deferred, not blocking: the prefix simply stops before the
+        // oldest unsummarized turn and the next pre-step re-evaluates, so a
+        // turn that becomes ready is picked up without waiting inside a turn.
+        const isTurnReady = (candidateTurn: number): boolean => {
+          let state;
+          try {
+            state = getTurnExtractionReadiness(db, sid, candidateTurn);
+          } catch (error) {
+            // A failed readiness read cannot prove the summary exists, so the
+            // turn is not archived. The foreground turn is never delayed.
+            compactionMetrics.readinessErrors += 1;
+            ctx.logger.warn(`[graph-memory] turn readiness unreadable for turn=${candidateTurn}: ${String(error)}`);
+            return false;
+          }
+          // `missing` means no durable Q/A pair was captured at all: there is
+          // nothing to learn, so there is nothing to wait for.
+          if (state === "ready" || state === "missing") return true;
+          if (state === "quarantined") {
+            // A poisoned turn is never retried on its own; holding the window
+            // forever would let the session grow again. Archive it after the
+            // grace window; its raw pair stays durable and searchable.
+            return currentTurn !== undefined
+              && currentTurn - candidateTurn > freshTurnCount + QUARANTINE_GRACE_TURNS;
+          }
+          return false;
+        };
         const range = selectDshRollingCompactionRange(
           agent?.session,
           freshTurnCount,
           !hasIncomingUser,
+          isTurnReady,
         );
         if (range) {
           compactionMetrics.selected += 1;
@@ -750,9 +952,16 @@ export function apply(ctx: DshContext, input: Config = {}): void {
           compactionMetrics.succeeded += 1;
           compactionMetrics.shadowedEvents += result.shadowedSeqs.length;
           compactionMetrics.shadowedTokens += result.shadowedTokenCount;
+          if (range.deferredUserTurns !== undefined) {
+            compactionMetrics.deferredRuns += 1;
+            compactionMetrics.deferredTurns += range.deferredUserTurns;
+          }
           ctx.logger.info(
             `[graph-memory] archived ${result.shadowedSeqs.length} surface events ` +
-            `(~${result.shadowedTokenCount} tokens); retained ${freshTurnCount} previous user turns`,
+            `(~${result.shadowedTokenCount} tokens); retained ${freshTurnCount} previous user turns` +
+            (range.deferredUserTurns === undefined
+              ? ""
+              : `; ${range.deferredUserTurns} completed turn(s) still wait for their summary`),
           );
         }
       } catch (error) {
@@ -764,7 +973,25 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     }
     const id = agent?.id ?? agent?.session?.id;
     const decision = await next();
-    if (!recallEnabled || closing || signal?.aborted || step !== 1 || decision?.kind === "reject") {
+    // `turn` numbers the session's user turns, so 1 is its first one; a harness
+    // that does not pass it keeps the original per-turn behaviour.
+    const sessionFirstTurn = turn === undefined || turn === 1;
+    // Two independent sources decide what automatic recall may inject. Other
+    // sessions' memory is welcome where it was asked for: at session start by
+    // default, before every message only when the user opted into that. This
+    // session's own history is injected only while the takeover keeps it off the
+    // surface, so an ordinary follow-up question whose history is all visible
+    // carries no recalled block at all.
+    const wantCrossSession = recallCrossSession === "every-turn"
+      || (recallCrossSession === "first-turn" && sessionFirstTurn);
+    if (
+      !recallEnabled
+      || closing
+      || signal?.aborted
+      || step !== 1
+      || (!wantCrossSession && !recallSessionHistory)
+      || decision?.kind === "reject"
+    ) {
       return decision;
     }
     if (id === undefined) return decision;
@@ -777,8 +1004,6 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       // is still in flight. Historical recall must wait for that shared probe;
       // otherwise the very first cross-session question can miss all vectors.
       await embeddingReady;
-      const recalled = await recaller.recall(query);
-      signal?.throwIfAborted?.();
       const key = String(id);
       const currentSession = sessionKey(id);
       const session = agent?.session;
@@ -797,25 +1022,52 @@ export function apply(ctx: DshContext, input: Config = {}): void {
             || (source?.kind === "plugin" && source?.plugin === PLUGIN));
       };
       const hasArchivedHistory = surfaceSeqs.some(seq => isOwnArchivedMarker(immutableEvents?.[seq]));
-      const recalledNodes = filterDshRecallNodes(
+      // No cross-session allowance left and nothing hidden yet: every memory the
+      // search could return is already visible on the surface. Leave before the
+      // search, so the follow-up turns of an ordinary session cost neither
+      // tokens nor an embedding request.
+      if (!wantCrossSession && !hasArchivedHistory) return decision;
+      const recalled = await recaller.recall(query);
+      signal?.throwIfAborted?.();
+      // Anything this session's earlier recall blocks still show is already on
+      // the surface and already paid for. Skip it here; once rolling
+      // compaction archives that block, its identifiers disappear and the
+      // memory becomes injectable again.
+      const presented = collectPresentedRecall(session);
+      let recalledNodes = filterDshRecallNodes(
         recalled.nodes,
         getNodeSources(db, recalled.nodes.map(node => node.id)),
         currentSession,
         visibleMessageIds,
         hasArchivedHistory,
-      );
-      const recalledMemories = filterDshRecallMemories(
+      ).filter(node => !presented.nodeNames.has(node.name));
+      let recalledMemories = filterDshRecallMemories(
         recalled.turnMemories,
         currentSession,
         visibleMessageIds,
-      );
+      ).filter(memory => !presented.memoryIds.has(memory.id));
+      // The search itself knows no session boundary; the two reach settings do.
+      // Drop whatever the user did not ask for, keeping the sources independent.
+      if (!wantCrossSession) {
+        recalledNodes = recalledNodes.filter(node => node.sourceSessions.includes(currentSession));
+        recalledMemories = recalledMemories.filter(memory => memory.sessionId === currentSession);
+      }
+      if (!recallSessionHistory) {
+        recalledNodes = recalledNodes.filter(node =>
+          node.sourceSessions.some(sessionId => sessionId !== currentSession));
+        recalledMemories = recalledMemories.filter(memory => memory.sessionId !== currentSession);
+      }
       if (!recalledNodes.length && !recalledMemories.length) return decision;
       const recalledIds = new Set(recalledNodes.map(node => node.id));
+      const keptMemoryIds = new Set(recalledMemories.map(memory => memory.id));
       const built = assembleContext(db, {
         recalledNodes,
         recalledEdges: recalled.edges.filter(edge => recalledIds.has(edge.fromId) && recalledIds.has(edge.toId)),
         recalledMemories,
-        recalledTriples: recalled.triples,
+        // Navigation triples point at memories; keep only those whose memory
+        // survived the reach filters, or the block would cite a capsule that is
+        // not there.
+        recalledTriples: recalled.triples.filter(triple => keptMemoryIds.has(triple.memoryId)),
         freshTurnCount,
         // Tell the model the truth about its own history: with the takeover
         // flags off nothing is archived, so the addition must not claim it is.
@@ -942,7 +1194,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       const turnVectorCount = Number((db.prepare("SELECT COUNT(*) AS count FROM gm_turn_vectors").get() as any)?.count ?? 0);
       const extraction = getExtractionStats(db);
       const retentionRevision = messageRetentionPolicyRevision(messageRetention);
-      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nTurn memories: ${stats.turnMemories}\nNavigation: ${stats.navigationTerms} terms / ${stats.navigationTriples} triples / ${stats.navigationCommunities} communities\nLegacy graph: ${stats.totalNodes} nodes / ${stats.totalEdges} edges\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"} (pending=${extraction.pending}, succeeded=${extraction.succeeded}, quarantined=${extraction.quarantined})\nExtraction source: one completed turn = user question + final answer\nExtraction scheduling: live turn/end only, one serial worker per session, no startup history import, no automatic retries\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nTurn vectors: ${turnVectorCount}/${stats.turnMemories}\nLegacy vectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nAssistant tools: ${assistantTools}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nContext takeover: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, failed=${compactionMetrics.failed}, shadowedEvents=${compactionMetrics.shadowedEvents}, shadowedTokens=${compactionMetrics.shadowedTokens}, projectedTurns=${compactionMetrics.projectedTurns}, projectedEvents=${compactionMetrics.projectedEvents}, projectedTokens=${compactionMetrics.projectedTokens}`;
+      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nTurn memories: ${stats.turnMemories}\nNavigation: ${stats.navigationTerms} terms / ${stats.navigationTriples} triples / ${stats.navigationCommunities} communities\nLegacy graph: ${stats.totalNodes} nodes / ${stats.totalEdges} edges\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"} (pending=${extraction.pending}, succeeded=${extraction.succeeded}, quarantined=${extraction.quarantined}, retriesScheduled=${extractionMetrics.retriesScheduled}, retryTicks=${extractionMetrics.retryTicks}, parkedAfterRetries=${extractionMetrics.quarantinedAfterRetries})\nExtraction source: one completed turn = user question + final answer\nExtraction scheduling: live turn/end only, one serial worker per session, no startup history import, no automatic retries\nRecall: ${recallEnabled ? "enabled" : "disabled"} (other sessions: ${recallCrossSession}, this session's hidden history: ${recallSessionHistory ? "on" : "off"})\nEmbedding: ${embeddingState}${embeddingModel}\nTurn vectors: ${turnVectorCount}/${stats.turnMemories}\nLegacy vectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nAssistant tools: ${assistantTools}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nContext takeover: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, failed=${compactionMetrics.failed}, shadowedEvents=${compactionMetrics.shadowedEvents}, shadowedTokens=${compactionMetrics.shadowedTokens}, projectedTurns=${compactionMetrics.projectedTurns}, projectedEvents=${compactionMetrics.projectedEvents}, projectedTokens=${compactionMetrics.projectedTokens}, deferredRuns=${compactionMetrics.deferredRuns}, deferredTurns=${compactionMetrics.deferredTurns}, readinessErrors=${compactionMetrics.readinessErrors}\n${optimalStatusLine()}`;
     },
   });
 
@@ -1072,6 +1324,37 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     pendingTurnProjections.clear();
     db.close();
   }, "graph-memory.close");
+
+  // Bounded retry scheduler. A failed extraction keeps its durable pair in
+  // `pending` with a future retry time; this tick picks up whatever has become
+  // due. It never blocks a turn, never retries past the attempt budget, and is
+  // torn down with the plugin. Sessions already being processed are skipped so
+  // a slow extraction cannot accumulate queued runs.
+  if (extractionEnabled) {
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        if (closing || abortingExtraction) return;
+        try {
+          const due = getPendingSessionIds(db);
+          if (!due.length) return;
+          extractionMetrics.retryTicks += 1;
+          for (const sid of due) {
+            const rawId = sid.startsWith(`${HOST}:`) ? sid.slice(HOST.length + 1) : sid;
+            if (extractChain.has(rawId)) continue;
+            // No usable route yet: leave the pair durable and wait, exactly as
+            // the startup recovery path does.
+            if (!(effective.llmProvider && effective.llmModel) && !latestRoute.has(rawId)) continue;
+            void scheduleExtract(rawId);
+          }
+        } catch (error) {
+          ctx.logger.warn(`[graph-memory] extraction retry tick failed: ${String(error)}`);
+        }
+      }, AUTORETRY_TICK_MS);
+      // An idle retry timer must never hold a one-shot host process open.
+      (timer as { unref?: () => void }).unref?.();
+      return () => clearInterval(timer);
+    }, "graph-memory.extraction-retry");
+  }
 
   // With an explicit fallback route, recover durable pending work from prior
   // process exits even when those sessions are not reopened in the UI.

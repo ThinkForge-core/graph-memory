@@ -3,11 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { apply } from "../dsh.ts";
+import { OPTIMAL_SETTINGS_REVISION, apply } from "../dsh.ts";
 import { GRAPH_EXTRACTION_TOOL_NAME } from "../src/extractor/contract.ts";
 import { detectNavigationCommunities } from "../src/graph/community.ts";
 import { DatabaseSync } from "../src/store/sqlite.ts";
+import { openDb } from "../src/store/db.ts";
 import {
+  markMessagesExtracted,
   replaceNavigationTriples,
   saveMessageOnce,
   upsertTurnMemory,
@@ -192,6 +194,116 @@ describe("native DSH context takeover", () => {
     await Promise.all(cleanups.map(cleanup => cleanup()));
   });
 
+  it("defers surface archiving until the completed turn has a summary", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-readiness-"));
+    const dbPath = join(dir, "memory.db");
+    // A durable pair whose summary does not exist yet: the readiness gate must
+    // keep it on the surface instead of archiving it into silence.
+    const seed = openDb(dbPath);
+    saveMessageOnce(seed, "dsh:readiness-test:1:q", "dsh:readiness-test", 1, "user", "question");
+    saveMessageOnce(seed, "dsh:readiness-test:1:a", "dsh:readiness-test", 1, "assistant", "answer");
+    seed.close();
+
+    const listeners = new Map<string, Array<(...args: any[]) => any>>();
+    const cleanups: Array<() => void | Promise<void>> = [];
+    const context: any = {
+      logger: { info() {}, warn() {}, error() {} },
+      llm: { async *stream() {} },
+      tools: { register() { return () => {}; } },
+      credentials: { async resolve() { return undefined; } },
+      tokenMeter: {
+        measure(session: any) {
+          return { nodes: session.surface.nodes.map((seq: number) => ({ seq, heuristicTokens: 10 })) };
+        },
+      },
+      on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+        const current = listeners.get(name) ?? [];
+        if (options?.prepend) current.unshift(listener);
+        else current.push(listener);
+        listeners.set(name, current);
+        return () => {};
+      },
+      effect(register: () => () => void | Promise<void>) {
+        cleanups.push(register());
+        return () => {};
+      },
+    };
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: true,
+      freshTurnCount: 2,
+    });
+
+    const events: any[] = [];
+    const surface: number[] = [];
+    const agentListeners = new Map<string, Array<(...args: any[]) => any>>();
+    for (let turn = 1; turn <= 3; turn += 1) {
+      events.push({ type: "turn/start", seq: events.length, data: { turn } });
+      const userSeq = events.length;
+      events.push({ type: "user/message", seq: userSeq, data: { source: { kind: "user" } } });
+      surface.push(userSeq);
+      const assistantSeq = events.length;
+      events.push({ type: "assistant/message", seq: assistantSeq, data: {} });
+      surface.push(assistantSeq);
+    }
+    const session: any = {
+      id: "readiness-test",
+      events,
+      surface: { nodes: surface },
+      append(type: string, data: any, options?: any) {
+        const seq = events.length;
+        const event = { type, seq, data, ...options };
+        events.push(event);
+        if (options?.surfaceOp?.op === "replace") {
+          const start = surface.indexOf(options.surfaceOp.startSeq);
+          const end = surface.indexOf(options.surfaceOp.endSeq);
+          surface.splice(start, end - start + 1, seq);
+        }
+        return event;
+      },
+    };
+    const agent = {
+      id: "readiness-test",
+      session,
+      ctx: {
+        on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+          const current = agentListeners.get(name) ?? [];
+          if (options?.prepend) current.unshift(listener);
+          else current.push(listener);
+          agentListeners.set(name, current);
+          return () => {};
+        },
+      },
+    };
+    listeners.get("agent/created")![0]({ agent });
+    const step = () => agentListeners.get("agent/pre-step")![0]({
+      agent,
+      messages: [{ source: { kind: "user" } }],
+      signal: new AbortController().signal,
+      turn: 3,
+    }, async () => "continued");
+
+    await step();
+    expect(events.some(event => event.type === "compaction/prune")).toBe(false);
+
+    // The summary now exists: the very next pre-step may archive the turn.
+    const flip = openDb(dbPath);
+    markMessagesExtracted(flip, ["dsh:readiness-test:1:q", "dsh:readiness-test:1:a"]);
+    flip.close();
+
+    await step();
+    expect(events.at(-2)).toMatchObject({ type: "compaction/prune" });
+    expect(events.at(-1)).toMatchObject({
+      type: "user/message",
+      surfaceOp: { op: "replace" },
+    });
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("refuses surface compaction when the recall path cannot replace it", async () => {
     const listeners = new Map<string, Array<(...args: any[]) => any>>();
     const cleanups: Array<() => void | Promise<void>> = [];
@@ -276,6 +388,68 @@ describe("native DSH context takeover", () => {
     expect(events.some(event => event.type === "compaction/prune")).toBe(false);
     expect(surface).toEqual([0, 1, 2, 3, 4, 5]);
     await Promise.all(cleanups.map(cleanup => cleanup()));
+  });
+
+  /** A context that only records warnings; enough to observe the takeover guard. */
+  function warningContext(warnings: string[]): any {
+    return {
+      logger: {
+        info() {},
+        warn(message: unknown) { warnings.push(String(message)); },
+        error() {},
+      },
+      llm: { async *stream() {} },
+      tools: { register() { return () => {}; } },
+      credentials: { async resolve() { return undefined; } },
+      tokenMeter: { measure() { return { nodes: [] }; } },
+      on() { return () => {}; },
+      effect(register: () => () => void | Promise<void>) { register(); return () => {}; },
+    };
+  }
+
+  it("keeps the takeover when only the cross-session reach is bounded", () => {
+    const warnings: string[] = [];
+    apply(warningContext(warnings), {
+      dbPath: ":memory:",
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: true,
+      // The combination the card used to forbid: other conversations are read
+      // once at session start, while this session's hidden history stays
+      // recoverable — which is all the takeover needs.
+      recallCrossSession: "first-turn",
+      recallSessionHistory: true,
+    });
+
+    expect(warnings.some(message => message.includes("contextCompactionEnabled ignored"))).toBe(false);
+  });
+
+  it("refuses the takeover when this session's hidden history cannot come back", () => {
+    const warnings: string[] = [];
+    apply(warningContext(warnings), {
+      dbPath: ":memory:",
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: true,
+      // Cross-session reach of any width cannot return an archived turn of THIS
+      // session, so the takeover has nothing to put back and is refused.
+      recallCrossSession: "every-turn",
+      recallSessionHistory: false,
+    });
+
+    expect(warnings.some(message =>
+      message.includes("contextCompactionEnabled ignored")
+      && message.includes("recallSessionHistory=false"))).toBe(true);
+  });
+
+  it("reports the retired single switch instead of honouring it", () => {
+    const warnings: string[] = [];
+    apply(warningContext(warnings), {
+      dbPath: ":memory:",
+      recallOnFirstTurnOnly: true,
+    });
+
+    expect(warnings.some(message => message.includes("recallOnFirstTurnOnly is deprecated"))).toBe(true);
   });
 
   it("keeps a 30-turn model surface bounded instead of growing linearly", async () => {
@@ -438,7 +612,9 @@ describe("native DSH context takeover", () => {
       extractionEnabled: false,
       recallEnabled: true,
       contextCompactionEnabled: false,
-      recallMaxNodes: 2,
+      // Wide enough that the session's own memory is not crowded out of the
+      // candidate set by the (higher-ranked) cross-session matches.
+      recallMaxNodes: 6,
     });
 
     const stored = new DatabaseSync(dbPath);
@@ -528,6 +704,78 @@ describe("native DSH context takeover", () => {
     expect(recalled).not.toContain("晚餐选择了面条");
     expect(decision.messages[1]).toBe(currentUser);
 
+    // Session start only: the plugin's first user turn (turn 1) recalls, while
+    // a later turn of the same session is answered without the recalled block.
+    const firstTurn = await agentListeners.get("agent/pre-step")![0]({
+      agent,
+      messages: [currentUser],
+      signal: new AbortController().signal,
+      step: 1,
+      turn: 1,
+    }, async () => ({ kind: "enter", messages: [currentUser] }));
+    expect(firstTurn.messages).toHaveLength(2);
+    expect(firstTurn.messages[0].source).toMatchObject({ kind: "plugin:graph-memory" });
+
+    const laterTurn = await agentListeners.get("agent/pre-step")![0]({
+      agent,
+      messages: [currentUser],
+      signal: new AbortController().signal,
+      step: 1,
+      turn: 2,
+    }, async () => ({ kind: "enter", messages: [currentUser] }));
+    expect(laterTurn.messages).toHaveLength(1);
+    expect(laterTurn.messages[0]).toBe(currentUser);
+
+    // Cross-session reach is spent, so it is not what brings anything back.
+    // Once THIS session's own history has been folded away, a later turn gets
+    // that hidden history — and only it: material from other conversations
+    // stays out even though the search still ranks it high.
+    const stored2 = new DatabaseSync(dbPath);
+    const ownUserId = "dsh:current-session:101";
+    const ownAssistantId = "dsh:current-session:102";
+    saveMessageOnce(stored2, ownUserId, "dsh:current-session", 101, "user", "主题色定了吗？");
+    saveMessageOnce(stored2, ownAssistantId, "dsh:current-session", 101, "assistant", "已确认。");
+    const ownMemory = upsertTurnMemory(stored2, {
+      sessionId: "dsh:current-session",
+      summary: "本次会话已确认主题色为深海蓝。",
+      outcome: "completed",
+      sources: [
+        { messageId: ownUserId, turnIndex: 101 },
+        { messageId: ownAssistantId, turnIndex: 101 },
+      ],
+    });
+    replaceNavigationTriples(stored2, ownMemory, [
+      { subject: "本次会话", predicate: "确认", object: "深海蓝" },
+    ]);
+    detectNavigationCommunities(stored2);
+    stored2.close();
+
+    // The marker rolling compaction leaves behind: surface seq 0 is a replaced
+    // user message owned by this plugin.
+    agent.session = {
+      id: "current-session",
+      events: [{
+        type: "user/message",
+        seq: 0,
+        surfaceOp: { op: "replace", startSeq: 0, endSeq: 0 },
+        data: { source: { kind: "plugin:graph-memory" } },
+      }],
+      surface: { nodes: [0] },
+    };
+
+    const hiddenTurn = await agentListeners.get("agent/pre-step")![0]({
+      agent,
+      messages: [currentUser],
+      signal: new AbortController().signal,
+      step: 1,
+      turn: 2,
+    }, async () => ({ kind: "enter", messages: [currentUser] }));
+
+    expect(hiddenTurn.messages).toHaveLength(2);
+    const hidden = hiddenTurn.messages[0].content[0].text;
+    expect(hidden).toContain("本次会话已确认主题色为深海蓝");
+    expect(hidden).not.toContain("品牌模板");
+
     await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
   });
@@ -596,6 +844,22 @@ function countState(dbPath: string, state: string): number {
   try {
     const row = db.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE extraction_state = ?").get(state) as any;
     return Number(row.c);
+  } finally {
+    db.close();
+  }
+}
+
+/** Attempt count and scheduled retry time of the newest failed extraction. */
+function retryState(dbPath: string): { attempts: number; retryAt: number | null } {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare(
+      "SELECT MAX(extraction_attempts) AS attempts, MIN(extraction_next_retry_at) AS retryAt FROM gm_messages",
+    ).get() as any;
+    return {
+      attempts: Number(row?.attempts ?? 0),
+      retryAt: row?.retryAt === null || row?.retryAt === undefined ? null : Number(row.retryAt),
+    };
   } finally {
     db.close();
   }
@@ -721,6 +985,14 @@ describe("DSH completed-turn memory extraction", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0].maxTokens).toBeUndefined();
     expect(requests[0].reasoningEffort).toBe("off");
+    // Deterministic sampling plus an explicit, language-neutral output
+    // contract: a small local model refused the tool call stochastically
+    // without them.
+    expect(requests[0].temperature).toBe(0);
+    expect(requests[0].system).toContain(`call ${GRAPH_EXTRACTION_TOOL_NAME} exactly once`);
+    expect(requests[0].system).toContain("A text answer is a failure");
+    expect(requests[0].system).toContain("a second call is a failure");
+    expect(requests[0].system).toContain('"triples": []');
     expect(requests[0].tools).toHaveLength(1);
     expect(requests[0].tools[0].name).toBe(GRAPH_EXTRACTION_TOOL_NAME);
     expect(requests[0].tools[0].parameters.required).toEqual(["summary", "outcome", "triples"]);
@@ -946,7 +1218,13 @@ describe("DSH completed-turn memory extraction", () => {
       { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
     ] };
     await listeners.get("session/event")![0](session, session.events[3]);
-    await waitFor(() => countState(dbPath, "quarantined") === 2);
+    // The failure is retried, not parked: nothing bogus is persisted and the
+    // attempt is recorded with a future retry time.
+    await waitFor(() => retryState(dbPath).attempts === 1);
+    expect(countState(dbPath, "pending")).toBe(2);
+    expect(countState(dbPath, "succeeded")).toBe(0);
+    expect(countState(dbPath, "quarantined")).toBe(0);
+    expect(retryState(dbPath).retryAt).toBeGreaterThan(Date.now());
     expect(calls).toBe(1);
 
     await Promise.all(cleanups.map(cleanup => cleanup()));
@@ -974,7 +1252,13 @@ describe("DSH completed-turn memory extraction", () => {
       { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
     ] };
     await listeners.get("session/event")![0](session, session.events[3]);
-    await waitFor(() => countState(dbPath, "quarantined") === 2);
+    // Nothing is guessed or repaired: the turn stays durable and pending, and
+    // the bounded retry is what eventually parks it.
+    await waitFor(() => retryState(dbPath).attempts === 1);
+    expect(countState(dbPath, "pending")).toBe(2);
+    expect(countState(dbPath, "succeeded")).toBe(0);
+    expect(countState(dbPath, "quarantined")).toBe(0);
+    expect(retryState(dbPath).retryAt).toBeGreaterThan(Date.now());
 
     await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
@@ -1030,7 +1314,212 @@ describe("DSH completed-turn memory extraction", () => {
       { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
     ] };
     await listeners.get("session/event")![0](session, session.events[3]);
+    // Nothing is guessed or repaired: the turn stays durable and pending, and
+    // the bounded retry is what eventually parks it.
+    await waitFor(() => retryState(dbPath).attempts === 1);
+    expect(countState(dbPath, "pending")).toBe(2);
+    expect(countState(dbPath, "succeeded")).toBe(0);
+    expect(countState(dbPath, "quarantined")).toBe(0);
+    expect(retryState(dbPath).retryAt).toBeGreaterThan(Date.now());
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("parks a turn once the retry budget is exhausted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-retry-budget-"));
+    const dbPath = join(dir, "graph-memory.db");
+    // Two attempts are already spent; the next failure must park the turn.
+    const seed = openDb(dbPath);
+    const insert = seed.prepare(`
+      INSERT INTO gm_messages
+        (id, session_id, turn_index, role, content, created_at, extraction_attempts)
+      VALUES (?, 'dsh:exhausted-turn', 1, ?, ?, ?, 2)
+    `);
+    insert.run("dsh:exhausted-turn:1", "user", JSON.stringify("question"), Date.now());
+    insert.run("dsh:exhausted-turn:2", "assistant", JSON.stringify("answer"), Date.now());
+    seed.close();
+
+    let calls = 0;
+    const { context, listeners, cleanups } = adapterContext(async function* () {
+      calls += 1;
+      yield { type: "text-delta", text: EMPTY_EXTRACTION };
+      yield { type: "finish", reason: { kind: "stop" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+    });
+    const session: any = { id: "exhausted-turn", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "question"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "answer" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[3]);
     await waitFor(() => countState(dbPath, "quarantined") === 2);
+    expect(calls).toBe(1);
+    expect(retryState(dbPath).attempts).toBe(3);
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("DSH optimal settings preset", () => {
+  /** Minimal Settings service double: records every write, exposes one descriptor. */
+  function settingsDouble(revision = 7) {
+    const updates: Array<{ ns: string; patch: any; revision: number | undefined }> = [];
+    const settings = {
+      configure() { return () => {}; },
+      describe() {
+        return [{ ns: "graph-memory", revision, user: {}, value: {}, base: {} }];
+      },
+      async update(ns: string, patch: any, nextRevision?: number) {
+        updates.push({ ns, patch, revision: nextRevision });
+      },
+    };
+    return { settings, updates };
+  }
+
+  function optimalContext(settings: any) {
+    const listeners = new Map<string, Array<(...args: any[]) => any>>();
+    const cleanups: Array<() => void | Promise<void>> = [];
+    const context: any = {
+      logger: { info() {}, warn() {}, error() {} },
+      llm: { async *stream() {} },
+      tools: { register() { return () => {}; } },
+      credentials: { async resolve() { return undefined; } },
+      tokenMeter: {
+        measure(session: any) {
+          return { nodes: session.surface.nodes.map((seq: number) => ({ seq, heuristicTokens: 10 })) };
+        },
+      },
+      on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+        const current = listeners.get(name) ?? [];
+        if (options?.prepend) current.unshift(listener);
+        else current.push(listener);
+        listeners.set(name, current);
+        return () => {};
+      },
+      effect(register: () => () => void | Promise<void>) {
+        cleanups.push(register());
+        return () => {};
+      },
+      inject(_names: string[], callback: (child: any) => void) {
+        callback({
+          settings,
+          effect(register: () => void) { register(); },
+        });
+      },
+    };
+    return { context, listeners, cleanups };
+  }
+
+  it("writes the preset once and makes it live for the running instance", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-optimal-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const { settings, updates } = settingsDouble(7);
+    const { context, listeners, cleanups } = optimalContext(settings);
+
+    apply(context, {
+      dbPath,
+      // Deliberately non-optimal stored configuration.
+      extractionEnabled: false,
+      recallEnabled: false,
+      contextCompactionEnabled: false,
+      recallCrossSession: "never",
+      freshTurnCount: 2,
+      recallMaxNodes: 6,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toMatchObject({ ns: "graph-memory", revision: 7 });
+    expect(updates[0].patch).toMatchObject({
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: true,
+      projectCompletedTurnTools: true,
+      recallCrossSession: "first-turn",
+      recallSessionHistory: true,
+      freshTurnCount: 5,
+      recallMaxNodes: 4,
+      assistantTools: "all",
+      appliedOptimalRevision: OPTIMAL_SETTINGS_REVISION,
+    });
+
+    // Live for this run: the preset turns the takeover on, so a surface past
+    // the (new) five-turn window archives its prefix on the very next step.
+    const events: any[] = [];
+    const surface: number[] = [];
+    for (let turn = 1; turn <= 7; turn += 1) {
+      events.push({ type: "turn/start", seq: events.length, data: { turn } });
+      const userSeq = events.length;
+      events.push({ type: "user/message", seq: userSeq, data: { source: { kind: "user" } } });
+      surface.push(userSeq);
+      const assistantSeq = events.length;
+      events.push({ type: "assistant/message", seq: assistantSeq, data: {} });
+      surface.push(assistantSeq);
+    }
+    const agentListeners = new Map<string, Array<(...args: any[]) => any>>();
+    const session: any = {
+      id: "optimal-test",
+      events,
+      surface: { nodes: surface },
+      append(type: string, data: any, options?: any) {
+        const seq = events.length;
+        const event = { type, seq, data, ...options };
+        events.push(event);
+        return event;
+      },
+    };
+    const agent: any = {
+      id: "optimal-test",
+      session,
+      ctx: {
+        on(name: string, listener: (...args: any[]) => any) {
+          const current = agentListeners.get(name) ?? [];
+          current.push(listener);
+          agentListeners.set(name, current);
+          return () => {};
+        },
+      },
+    };
+    listeners.get("agent/created")![0]({ agent });
+    await agentListeners.get("agent/pre-step")![0]({
+      agent,
+      messages: [{ source: { kind: "user" } }],
+      signal: new AbortController().signal,
+      turn: 8,
+    }, async () => "continued");
+
+    expect(events.some(event => event.type === "compaction/prune")).toBe(true);
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("leaves a deployment alone once its stamp matches the revision", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-optimal-stamped-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const { settings, updates } = settingsDouble();
+    const { context, cleanups } = optimalContext(settings);
+
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: true,
+      contextCompactionEnabled: false,
+      freshTurnCount: 9,
+      appliedOptimalRevision: OPTIMAL_SETTINGS_REVISION,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(updates).toHaveLength(0);
 
     await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });

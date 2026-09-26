@@ -11,6 +11,8 @@ interface DshSurfaceEvent {
   type?: string;
   data?: {
     source?: { kind?: string };
+    /** Present on `turn/start`; the readiness gate maps surface turns to it. */
+    turn?: number;
   };
 }
 
@@ -41,6 +43,11 @@ export interface DshCompactionRange {
   end: number;
   shadowedSeqs: number[];
   retainedUserTurns: number;
+  /**
+   * Completed turns that stayed on the surface only because their summary was
+   * not ready yet. Present only when a readiness gate stopped the range early.
+   */
+  deferredUserTurns?: number;
 }
 
 export interface DshArchiveReplacement {
@@ -63,15 +70,55 @@ export function isDshUserTurn(event: DshSurfaceEvent | undefined): boolean {
 }
 
 /**
+ * Map each surface user-prompt node to its DSH turn number.
+ *
+ * A `user/message` event carries no turn number of its own, so the number is
+ * read from the immutable log: walk it in seq order, remember the newest
+ * `turn/start`, and attach it to the next durable user prompt. Only surface
+ * nodes are reported; archived turns are not on the surface any more.
+ */
+export function dshSurfaceUserTurnNumbers(session: DshSurfaceSession): Map<number, number> {
+  const result = new Map<number, number>();
+  const surface = session.surface?.nodes;
+  const events = sessionEvents(session);
+  if (!Array.isArray(surface) || !Array.isArray(events)) return result;
+
+  const seqToTurn = new Map<number, number>();
+  let current: number | undefined;
+  for (let seq = 0; seq < events.length; seq += 1) {
+    const event = events[seq];
+    if (event?.type === "turn/start") {
+      const turn = Number(event.data?.turn);
+      if (Number.isInteger(turn) && turn > 0) current = turn;
+    }
+    if (current !== undefined && isDshUserTurn(event)) seqToTurn.set(seq, current);
+  }
+  for (const seq of surface) {
+    if (typeof seq !== "number") continue;
+    const turn = seqToTurn.get(seq);
+    if (turn !== undefined) result.set(seq, turn);
+  }
+  return result;
+}
+
+/**
  * Select the oldest complete surface prefix while retaining the newest N real
  * user turns. Their question/final-answer endpoints remain native; completed
  * intermediate traces may already have been projected separately. Plugin-owned
  * snapshots, skill catalogs and compaction checkpoints do not count as turns.
+ *
+ * An optional readiness gate makes the reduction deferred instead of blocking:
+ * when a completed turn that would be archived has no summary yet, the prefix
+ * stops before that turn and the rest waits. The caller re-runs this on every
+ * pre-step, so a turn that becomes ready is picked up without a timer. A turn
+ * whose number cannot be derived from the log is treated as ready: unknown
+ * numbering must not freeze the whole window on a legacy session.
  */
 export function selectDshRollingCompactionRange(
   session: DshSurfaceSession,
   freshTurnCount: number,
   currentUserAlreadyOnSurface = false,
+  isTurnReady?: (turn: number) => boolean,
 ): DshCompactionRange | null {
   if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
     throw new TypeError(`freshTurnCount must be a positive integer, received ${freshTurnCount}`);
@@ -87,10 +134,6 @@ export function selectDshRollingCompactionRange(
   const retainOnSurface = freshTurnCount + (currentUserAlreadyOnSurface ? 1 : 0);
   if (userPositions.length <= retainOnSurface) return null;
 
-  // pre-step runs before DSH appends the newly claimed prompt. Retain N
-  // completed previous user turns; the current prompt is appended afterwards.
-  const keepFromPosition = userPositions[userPositions.length - retainOnSurface];
-
   // DSH protects the system prompt at surface node 0: only another
   // system/message may replace exactly that node. Keep it outside Graph
   // Memory's historical projection, both to respect that invariant and to
@@ -98,6 +141,27 @@ export function selectDshRollingCompactionRange(
   // marker sits after the head and is deliberately folded into the next
   // replacement so archive markers stay constant-size instead of accumulating.
   const protectedHead = events[surface[0]]?.type === "system/message" ? 1 : 0;
+
+  // pre-step runs before DSH appends the newly claimed prompt. Retain N
+  // completed previous user turns; the current prompt is appended afterwards.
+  const candidateCount = userPositions.length - retainOnSurface;
+  let keepFromPosition = userPositions[candidateCount];
+
+  let deferredUserTurns: number | undefined;
+  if (isTurnReady) {
+    const turnNumbers = dshSurfaceUserTurnNumbers(session);
+    for (let index = 0; index < candidateCount; index += 1) {
+      const position = userPositions[index];
+      if (position < protectedHead) continue;
+      const turn = turnNumbers.get(surface[position]);
+      if (turn === undefined) continue;
+      if (isTurnReady(turn)) continue;
+      keepFromPosition = position;
+      deferredUserTurns = candidateCount - index;
+      break;
+    }
+  }
+
   if (keepFromPosition <= protectedHead) return null;
   const shadowedSeqs = surface.slice(protectedHead, keepFromPosition);
   if (!shadowedSeqs.length) return null;
@@ -107,6 +171,7 @@ export function selectDshRollingCompactionRange(
     end: shadowedSeqs[shadowedSeqs.length - 1],
     shadowedSeqs,
     retainedUserTurns: retainOnSurface,
+    ...(deferredUserTurns === undefined ? {} : { deferredUserTurns }),
   };
 }
 

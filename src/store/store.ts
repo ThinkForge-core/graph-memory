@@ -481,12 +481,15 @@ export function getNextUnextractedTurn(
   sid: string,
   completedTurn: number,
 ): any[] {
+  // A failed attempt schedules its own retry time; the backlog drainer must
+  // respect it, or a scheduled backoff would be retried immediately.
   const next = db.prepare(`
     SELECT MIN(turn_index) AS turn_index
     FROM gm_messages
     WHERE session_id=? AND extracted=0 AND extraction_state='pending'
       AND turn_index<=?
-  `).get(sid, completedTurn) as { turn_index?: number | null } | undefined;
+      AND (extraction_next_retry_at IS NULL OR extraction_next_retry_at<=?)
+  `).get(sid, completedTurn, Date.now()) as { turn_index?: number | null } | undefined;
   if (next?.turn_index === null || next?.turn_index === undefined) return [];
   return db.prepare(`
     SELECT * FROM gm_messages
@@ -571,6 +574,17 @@ export function recordExtractionFailure(
   return Number(result.changes);
 }
 
+/** Highest recorded attempt count across one turn's durable messages. */
+export function getExtractionAttempts(db: DatabaseSyncInstance, ids: string[]): number {
+  if (!ids.length) return 0;
+  const row = db.prepare(`
+    SELECT MAX(extraction_attempts) AS attempts
+    FROM gm_messages
+    WHERE id IN (${messageIdPlaceholders(ids)})
+  `).get(...ids) as { attempts?: number | null } | undefined;
+  return Number(row?.attempts ?? 0);
+}
+
 /** A poison message remains durable and explicitly unlearned until retried. */
 export function quarantineMessages(db: DatabaseSyncInstance, ids: string[], error: string): number {
   if (!ids.length) return 0;
@@ -598,6 +612,45 @@ export function requeueQuarantined(db: DatabaseSyncInstance, sid?: string): numb
         WHERE extraction_state='quarantined'
       `).run(Date.now());
   return Number(result.changes);
+}
+
+/** Readiness of one completed turn for surface archiving. */
+export type TurnExtractionReadiness = "ready" | "pending" | "quarantined" | "missing";
+
+/**
+ * Report whether one completed turn has already been summarized.
+ *
+ * `ready` means every durable message of that turn was extracted successfully,
+ * so the turn capsule exists and recall can put the turn back after it leaves
+ * the model surface. `missing` means the host captured no durable Q/A pair at
+ * all: there is nothing to learn and nothing to wait for. Anything mixed (one
+ * message pending or quarantined) stays `pending` and must not be archived.
+ */
+export function getTurnExtractionReadiness(
+  db: DatabaseSyncInstance,
+  sid: string,
+  turn: number,
+): TurnExtractionReadiness {
+  if (!Number.isInteger(turn) || turn < 1) return "missing";
+  const rows = db.prepare(`
+    SELECT extraction_state AS state, COUNT(*) AS count
+    FROM gm_messages
+    WHERE session_id=? AND turn_index=?
+    GROUP BY extraction_state
+  `).all(sid, turn) as Array<{ state: string; count: number }>;
+  if (!rows.length) return "missing";
+  let total = 0;
+  let succeeded = 0;
+  let quarantined = 0;
+  for (const row of rows) {
+    const count = Number(row.count);
+    total += count;
+    if (row.state === "succeeded") succeeded += count;
+    if (row.state === "quarantined") quarantined += count;
+  }
+  if (succeeded === total) return "ready";
+  if (quarantined === total) return "quarantined";
+  return "pending";
 }
 
 export function getExtractionStats(db: DatabaseSyncInstance): {

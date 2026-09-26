@@ -1,9 +1,11 @@
 # Graph Memory settings-card bundle patch.
 #
-# Mounts the browser half that renders the "Graph Memory" card in
-# Settings -> Plugins -> Configurable. It requires the Community plugin
-# (`graph-memory/dsh`), which registers the `graph-memory` settings namespace,
-# and it ships no host behaviour of its own.
+# Mounts the browser half that renders the "Graph Memory" configuration on the
+# `graph-memory` bundle's own page in the Plugins list (slot
+# `plugins.bundle.config`, key `graph-memory`; clicking that bundle's card opens
+# the page).
+# It requires the Community plugin (`graph-memory/dsh`), which exports the
+# `graph-memory` settings namespace, and it ships no host behaviour of its own.
 #
 #   dsh plugin --profile web add /absolute/path/to/graph-memory/dsh-ui
 #

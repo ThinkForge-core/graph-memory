@@ -14,7 +14,9 @@ import {
   searchNodes, topNodes, graphWalk, getBySession, getRecentBySession,
   saveMessageOnce, getNextUnextractedTurn,
   getExtractionStats, markMessagesExtracted, quarantineMessages, requeueQuarantined,
+  getExtractionAttempts, getPendingSessionIds, recordExtractionFailure,
   getNodeSourceMessages, markExtractionTurnCompleted, getExtractionCompletedTurn,
+  getTurnExtractionReadiness,
   getStats, saveVector, vectorSearch,
   vectorSearchWithScore,
 } from "../src/store/store.ts";
@@ -403,6 +405,47 @@ describe("message extraction state", () => {
     // A stale completion event can never move the watermark backwards.
     markExtractionTurnCompleted(db, "s1", 1);
     expect(getExtractionCompletedTurn(db, "s1")).toBe(2);
+  });
+
+  it("reports readiness of a completed turn for surface archiving", () => {
+    // No durable pair captured at all: nothing to learn, nothing to wait for.
+    expect(getTurnExtractionReadiness(db, "s1", 1)).toBe("missing");
+
+    saveMessageOnce(db, "q1", "s1", 1, "user", "question");
+    saveMessageOnce(db, "a1", "s1", 1, "assistant", "answer");
+    expect(getTurnExtractionReadiness(db, "s1", 1)).toBe("pending");
+
+    // A half-succeeded pair must not be treated as summarized.
+    markMessagesExtracted(db, ["q1"]);
+    expect(getTurnExtractionReadiness(db, "s1", 1)).toBe("pending");
+
+    markMessagesExtracted(db, ["a1"]);
+    expect(getTurnExtractionReadiness(db, "s1", 1)).toBe("ready");
+
+    saveMessageOnce(db, "q2", "s1", 2, "user", "question");
+    saveMessageOnce(db, "a2", "s1", 2, "assistant", "answer");
+    quarantineMessages(db, ["q2", "a2"], "poison");
+    expect(getTurnExtractionReadiness(db, "s1", 2)).toBe("quarantined");
+
+    // Readiness never leaks across turns or sessions.
+    expect(getTurnExtractionReadiness(db, "s1", 3)).toBe("missing");
+    expect(getTurnExtractionReadiness(db, "s2", 1)).toBe("missing");
+  });
+
+  it("defers a failed turn until its retry time and then offers it again", () => {
+    saveMessageOnce(db, "q", "s1", 1, "user", "question");
+    saveMessageOnce(db, "a", "s1", 1, "assistant", "answer");
+    markExtractionTurnCompleted(db, "s1", 1);
+
+    recordExtractionFailure(db, ["q", "a"], "model refused", Date.now() + 60_000);
+    expect(getExtractionAttempts(db, ["q", "a"])).toBe(1);
+    // Not due yet: neither the backlog drainer nor the scheduler may take it.
+    expect(getNextUnextractedTurn(db, "s1", 1)).toEqual([]);
+    expect(getPendingSessionIds(db)).toEqual([]);
+
+    db.prepare("UPDATE gm_messages SET extraction_next_retry_at=? WHERE id IN ('q','a')").run(Date.now() - 1);
+    expect(getPendingSessionIds(db)).toEqual(["s1"]);
+    expect(getNextUnextractedTurn(db, "s1", 1).map(row => row.id)).toEqual(["q", "a"]);
   });
 
   it("tracks exact extraction success and quarantine without crossing turn boundaries", () => {

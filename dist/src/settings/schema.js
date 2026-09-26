@@ -1,34 +1,58 @@
 /**
- * DSH settings namespace for Graph Memory.
+ * DSH configuration schema for Graph Memory.
  *
- * The plugin config in `cordis.patch.yml` stays the composition layer; this
- * schema is what the Settings → Plugins card edits, and it layers on top:
- * schema defaults, then the composition entry, then the user document.
+ * The Cordis Loader validates this schema, layers schema defaults, the
+ * `cordis.patch.yml` composition entry and the user document the Settings card
+ * writes, then hands the result to `apply`. Nothing here registers itself with
+ * the settings service: since DSH 0.1.7 `settings.describe()` serves a
+ * namespace from the *profile entry* whose plugin exports this `Config`, and
+ * only when the entry's schema exposes at least one volatile field.
  *
- * Every field here is read once at plugin start, so the namespace declares
- * `applies: "restart"` and the card tells the user to restart `dsh web`.
+ * That is why every field the card edits is declared `.volatile()`: the field
+ * arrives as a stable reference the Loader updates in place on a settings
+ * write without remounting the plugin. Ordinary fields would force the
+ * ordinary update lifecycle instead.
+ *
+ * Every field is read once while the plugin wires itself, so a stored change
+ * takes effect on the next `dsh web` start and the card says exactly that.
  *
  * @module graph-memory/settings
  */
 import z from "@deepseek-ai/schemastery";
-/** Settings namespace owned by the DSH half of Graph Memory. */
+/** Profile entry id that owns this schema; also the settings namespace the card reads. */
 export const GRAPH_MEMORY_SETTINGS_NAMESPACE = "graph-memory";
 /**
- * Schema of the namespace. Defaults mirror the plugin's own fallbacks so a
- * composition entry that omits a field resolves to the same value as before.
+ * Schema the Loader validates and the Plugins card edits.
+ *
+ * Defaults mirror the plugin's own fallbacks so a composition entry that omits
+ * a field resolves to the same value as before. Every field the
+ * `graph-memory-ui-dsh` card edits carries `.volatile()`; the legacy
+ * `embedding.baseUrl` alias is not a card field and stays ordinary.
  */
 export const GRAPH_MEMORY_SETTINGS_SCHEMA = z.object({
-    extractionEnabled: z.boolean().default(true),
-    recallEnabled: z.boolean().default(true),
-    recallMaxNodes: z.number().step(1).min(1).default(6),
-    semanticScoreThreshold: z.number().min(-1).max(1),
-    assistantTools: z.union([z.const("none"), z.const("search"), z.const("all")]).default("none"),
-    maintenanceInterval: z.number().step(1).min(1).default(6),
-    freshTurnCount: z.number().step(1).min(1).default(5),
-    contextCompactionEnabled: z.boolean().default(false),
-    projectCompletedTurnTools: z.boolean().default(false),
-    llmProvider: z.string(),
-    llmModel: z.string(),
+    extractionEnabled: z.boolean().default(true).volatile(),
+    recallEnabled: z.boolean().default(true).volatile(),
+    recallMaxNodes: z.number().step(1).min(1).default(6).volatile(),
+    // Two independent reach settings instead of one switch: other sessions are
+    // read once at session start (the default) while this session's own history
+    // stays recoverable whenever the takeover hides it.
+    recallCrossSession: z
+        .union([z.const("first-turn"), z.const("every-turn"), z.const("never")])
+        .default("first-turn")
+        .volatile(),
+    recallSessionHistory: z.boolean().default(true).volatile(),
+    // Deprecated: superseded by the pair above and ignored by the host. Declared
+    // without a default so a profile that never carried it stays distinguishable
+    // from one that did.
+    recallOnFirstTurnOnly: z.boolean().volatile(),
+    semanticScoreThreshold: z.number().min(-1).max(1).volatile(),
+    assistantTools: z.union([z.const("none"), z.const("search"), z.const("all")]).default("none").volatile(),
+    maintenanceInterval: z.number().step(1).min(1).default(6).volatile(),
+    freshTurnCount: z.number().step(1).min(1).default(5).volatile(),
+    contextCompactionEnabled: z.boolean().default(false).volatile(),
+    projectCompletedTurnTools: z.boolean().default(false).volatile(),
+    llmProvider: z.string().volatile(),
+    llmModel: z.string().volatile(),
     llmReasoningEffort: z.union([
         z.const("off"),
         z.const("minimal"),
@@ -37,102 +61,55 @@ export const GRAPH_MEMORY_SETTINGS_SCHEMA = z.object({
         z.const("high"),
         z.const("xhigh"),
         z.const("max"),
-    ]).default("off"),
-    llmMaxTokens: z.number().step(1).min(1),
+    ]).default("off").volatile(),
+    llmMaxTokens: z.number().step(1).min(1).volatile(),
     embedding: z.object({
-        apiKeyEnv: z.string(),
-        baseURL: z.string(),
+        apiKeyEnv: z.string().volatile(),
+        baseURL: z.string().volatile(),
         baseUrl: z.string(),
-        model: z.string(),
-        dimensions: z.number().step(1).min(1),
+        model: z.string().volatile(),
+        dimensions: z.number().step(1).min(1).volatile(),
     }),
-    dbPath: z.string().default("~/.dsh/graph-memory/graph-memory.db"),
+    dbPath: z.string().default("~/.dsh/graph-memory/graph-memory.db").volatile(),
+    // Internal stamp, deliberately absent from the card's field list: the host
+    // writes the optimal preset once per revision. See OPTIMAL_SETTINGS_REVISION.
+    appliedOptimalRevision: z.string().volatile(),
     messageRetention: z.object({
-        keep: z.union([z.const("all"), z.const("referenced"), z.const("recent")]).default("all"),
-        recentTurns: z.number().step(1).min(0).default(0),
-        retentionDays: z.number().step(1).min(0).default(0),
-        batchSize: z.number().step(1).min(1).default(500),
-        dryRun: z.boolean().default(false),
+        keep: z.union([z.const("all"), z.const("referenced"), z.const("recent")]).default("all").volatile(),
+        recentTurns: z.number().step(1).min(0).default(0).volatile(),
+        retentionDays: z.number().step(1).min(0).default(0).volatile(),
+        batchSize: z.number().step(1).min(1).default(500).volatile(),
+        dryRun: z.boolean().default(false).volatile(),
     }),
 });
-/** Copy only the fields the composition entry actually declared. */
-function defined(value) {
-    const result = {};
-    for (const [key, entry] of Object.entries(value)) {
-        if (entry !== undefined)
-            result[key] = entry;
+/** The cosmokit volatile-reference protocol marker; `Symbol.for` matches it across module copies. */
+const VOLATILE_REF = Symbol.for("cosmokit.volatile.write");
+/** Whether a Loader-parsed value is a stable volatile reference rather than plain data. */
+function isVolatileRef(value) {
+    return typeof value === "object" && value !== null && VOLATILE_REF in value;
+}
+/** Replace every volatile reference with its current value, recursively. */
+function plainValues(value) {
+    if (isVolatileRef(value))
+        return plainValues(value.get());
+    if (Array.isArray(value))
+        return value.map(plainValues);
+    if (value !== null && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, plainValues(child)]));
     }
-    return result;
+    return value;
 }
 /**
- * Project the composition entry onto the schema's shape.
+ * Project the Loader-resolved configuration into the plain values `apply` uses.
  *
- * A field the entry did not declare is omitted, so it resolves from the schema
- * default instead of being pinned to a copy of it.
- * @param input - the plugin configuration from `cordis.patch.yml`.
- * @returns the composition layer for {@link GRAPH_MEMORY_SETTINGS_SCHEMA}.
+ * The Loader layers schema defaults, the `cordis.patch.yml` composition entry
+ * and the user document, then validates against {@link GRAPH_MEMORY_SETTINGS_SCHEMA}.
+ * Fields the card edits are volatile, so they arrive as references; this reads
+ * their current values once, which is why a stored change applies on the next
+ * `dsh web` start. Plain input (a hand-built context in tests) passes through.
+ * @param input - configuration the Loader resolved for this entry.
+ * @returns the effective Graph Memory configuration.
  */
-export function graphMemorySettingsBase(input) {
-    const base = defined({
-        extractionEnabled: input.extractionEnabled,
-        recallEnabled: input.recallEnabled,
-        recallMaxNodes: input.recallMaxNodes,
-        semanticScoreThreshold: input.semanticScoreThreshold,
-        assistantTools: input.assistantTools,
-        maintenanceInterval: input.maintenanceInterval,
-        freshTurnCount: input.freshTurnCount,
-        contextCompactionEnabled: input.contextCompactionEnabled,
-        projectCompletedTurnTools: input.projectCompletedTurnTools,
-        llmProvider: input.llmProvider,
-        llmModel: input.llmModel,
-        llmReasoningEffort: input.llmReasoningEffort,
-        llmMaxTokens: input.llmMaxTokens,
-        dbPath: input.dbPath,
-    });
-    if (input.embedding !== undefined) {
-        const embedding = defined({
-            apiKeyEnv: input.embedding.apiKeyEnv,
-            baseURL: input.embedding.baseURL,
-            baseUrl: input.embedding.baseUrl,
-            model: input.embedding.model,
-            dimensions: input.embedding.dimensions,
-        });
-        if (Object.keys(embedding).length > 0)
-            base.embedding = embedding;
-    }
-    if (input.messageRetention !== undefined) {
-        const retention = defined({
-            keep: input.messageRetention.keep,
-            recentTurns: input.messageRetention.recentTurns,
-            retentionDays: input.messageRetention.retentionDays,
-            batchSize: input.messageRetention.batchSize,
-            dryRun: input.messageRetention.dryRun,
-        });
-        if (Object.keys(retention).length > 0)
-            base.messageRetention = retention;
-    }
-    return base;
-}
-/**
- * Reject a section the plugin could not act on.
- *
- * Cross-field rules the schema cannot express: a half-configured extraction
- * route, a credential reference that is not an identifier, and a `recent`
- * retention window with neither bound set. Throwing here refuses the write
- * that produced the value, so a hostile document cannot strand the plugin.
- * @param value - the schema-resolved section.
- */
-export function validateGraphMemorySettings(value) {
-    if ((value.llmProvider === undefined) !== (value.llmModel === undefined)) {
-        throw new TypeError("[graph-memory] llmProvider and llmModel must be configured together");
-    }
-    const credentialRef = value.embedding?.apiKeyEnv;
-    if (credentialRef !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)) {
-        throw new TypeError(`[graph-memory] embedding.apiKeyEnv must be a credential reference, received ${JSON.stringify(credentialRef)}`);
-    }
-    if (value.messageRetention.keep === "recent"
-        && value.messageRetention.recentTurns === 0
-        && value.messageRetention.retentionDays === 0) {
-        throw new TypeError("[graph-memory] messageRetention.keep=recent requires recentTurns or retentionDays");
-    }
+export function resolveGraphMemorySettings(input) {
+    return plainValues(input);
 }

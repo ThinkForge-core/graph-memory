@@ -1,6 +1,6 @@
 {
   "name": "graph-memory-ui-dsh",
-  "version": "0.1.0-beta.3",
+  "version": "0.1.0-beta.10",
   "description": "Graph Memory settings card for DeepSeek Harness Web",
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
   },
   "engines": {
     "node": ">=22.13.0",
-    "dsh": "^0.1.5-rc.2"
+    "dsh": "^0.1.7-rc.1"
   },
   "main": "./index.js",
   "exports": {
@@ -31,7 +31,8 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   },
